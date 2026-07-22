@@ -7,7 +7,7 @@ on:
 
 permissions:
   actions: write
-  contents: read
+  contents: write   # time.txt git push 需要 write；原来 read 会 push 失败
 
 jobs:
   keepalive:
@@ -33,22 +33,53 @@ jobs:
         env:
           NODE_LINK: ${{ secrets.NODE_LINK }}
         run: |
+          set -euo pipefail
+          if [ -z "${NODE_LINK:-}" ]; then
+            echo "NODE_LINK 为空，跳过代理安装"
+            exit 0
+          fi
           bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
 
-      - name: 🛡️ 启动 GOST 代理转发
-        if: ${{ env.GOST_PROXY != '' }}
+      - name: 🩺 等待并验证本地 SOCKS (127.0.0.1:1080)
         env:
-          GOST_PROXY: ${{ secrets.GOST_PROXY }}
+          NODE_LINK: ${{ secrets.NODE_LINK }}
         run: |
-          VERSION=$(curl -s https://api.github.com/repos/ginuerzh/gost/releases/latest | grep '"tag_name"' | cut -d'"' -f4 | tr -d 'v')
-          echo "📦 GOST 版本: $VERSION"
-          wget -q "https://github.com/ginuerzh/gost/releases/download/v${VERSION}/gost_${VERSION}_linux_amd64.tar.gz"
-          tar -xzf "gost_${VERSION}_linux_amd64.tar.gz"
-          chmod +x gost
-          nohup ./gost -L http://:1080 -F "$GOST_PROXY" > gost.log 2>&1 &
-          sleep 3
-          echo "✅ GOST 已启动，测试连通性..."
-          curl -s -x http://127.0.0.1:1080 https://api.ipify.org | sed 's/\([0-9]*\)\..*/\1/'
+          set -euo pipefail
+          if [ -z "${NODE_LINK:-}" ]; then
+            echo "无 NODE_LINK，跳过代理校验"
+            echo "GOST_PROXY=" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          echo "等待 127.0.0.1:1080 监听..."
+          for i in $(seq 1 30); do
+            if ss -lnt 2>/dev/null | grep -qE '[:.]1080\s'; then
+              echo "端口 1080 已监听"
+              break
+            fi
+            # 兼容没有 ss 的情况
+            if (echo > /dev/tcp/127.0.0.1/1080) >/dev/null 2>&1; then
+              echo "端口 1080 可连接"
+              break
+            fi
+            sleep 2
+            if [ "$i" -eq 30 ]; then
+              echo "超时：1080 未就绪"
+              ss -lntp || netstat -lntp || true
+              exit 1
+            fi
+          done
+
+          echo "探测代理出口 IP（socks5h = DNS 也走代理）..."
+          EXIT_IP=$(curl -sS --max-time 25 --socks5-hostname 127.0.0.1:1080 https://api.ipify.org || true)
+          if [ -z "$EXIT_IP" ]; then
+            echo "代理探测失败：无法经 1080 访问外网"
+            exit 1
+          fi
+          echo "代理出口 IP: $EXIT_IP"
+
+          # 给后续 step + Playwright 使用（固定 IPv4，避免 localhost → ::1）
+          echo "GOST_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
 
       - name: 🚀 运行保活脚本
         env:
@@ -56,14 +87,13 @@ jobs:
           PANEL_ACCOUNT: ${{ secrets.PANEL_ACCOUNT }}
           TG_BOT: ${{ secrets.TG_BOT }}
           NODE_LINK: ${{ secrets.NODE_LINK }}
+          # GOST_PROXY 来自上一 step 的 GITHUB_ENV
         run: |
           set -euo pipefail
-          if [ -n "${NODE_LINK:-}" ]; then
-            export GOST_PROXY="socks5://127.0.0.1:1080"
-            echo "使用本地 SOCKS 代理"
+          if [ -n "${GOST_PROXY:-}" ]; then
+            echo "使用本地 SOCKS 代理: $GOST_PROXY"
           else
-            export GOST_PROXY=""
-            echo "直连"
+            echo "直连（无 GOST_PROXY）"
           fi
           npx playwright test
 
@@ -75,7 +105,7 @@ jobs:
           path: test-results/
           retention-days: 7
 
-                # ========== 防止 60 天无活动禁用 workflow ==========
+      # ========== 防止 60 天无活动禁用 workflow ==========
       - name: 📅 更新 time.txt 保持仓库活跃
         if: always()
         run: |
@@ -85,7 +115,6 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add time.txt
-          # 只有内容变化时才 commit（避免空 commit）
           if git diff --staged --quiet; then
             echo "time.txt 无变化，跳过 commit"
           else
