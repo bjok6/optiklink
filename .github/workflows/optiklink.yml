@@ -46,54 +46,36 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${NODE_LINK:-}" ]; then
-            echo "无 NODE_LINK，跳过代理校验"
-            echo "GOST_PROXY=" >> "$GITHUB_ENV"
+            echo "无 NODE_LINK，直连"
             exit 0
           fi
-
-          echo "等待 127.0.0.1:1080 监听..."
           for i in $(seq 1 30); do
             if ss -lnt 2>/dev/null | grep -qE '[:.]1080\s'; then
-              echo "端口 1080 已监听"
-              break
-            fi
-            # 兼容没有 ss 的情况
-            if (echo > /dev/tcp/127.0.0.1/1080) >/dev/null 2>&1; then
-              echo "端口 1080 可连接"
-              break
+              echo "端口 1080 已监听"; break
             fi
             sleep 2
             if [ "$i" -eq 30 ]; then
-              echo "超时：1080 未就绪"
-              ss -lntp || netstat -lntp || true
-              exit 1
+              echo "超时：1080 未就绪"; exit 1
             fi
           done
-
-          echo "探测代理出口 IP（socks5h = DNS 也走代理）..."
           EXIT_IP=$(curl -sS --max-time 25 --socks5-hostname 127.0.0.1:1080 https://api.ipify.org || true)
           if [ -z "$EXIT_IP" ]; then
-            echo "代理探测失败：无法经 1080 访问外网"
-            exit 1
+            echo "代理探测失败"; exit 1
           fi
           echo "代理出口 IP: $EXIT_IP"
-
-          # 给后续 step + Playwright 使用（固定 IPv4，避免 localhost → ::1）
-          echo "GOST_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
 
       - name: 🚀 运行保活脚本
         env:
           DISCORD_ACCOUNT: ${{ secrets.DISCORD_ACCOUNT }}
           PANEL_ACCOUNT: ${{ secrets.PANEL_ACCOUNT }}
           TG_BOT: ${{ secrets.TG_BOT }}
-          NODE_LINK: ${{ secrets.NODE_LINK }}
-          # GOST_PROXY 来自上一 step 的 GITHUB_ENV
+          NODE_LINK: ${{ secrets.NODE_LINK }}   # 必须传，config 靠它开 proxy
         run: |
           set -euo pipefail
-          if [ -n "${GOST_PROXY:-}" ]; then
-            echo "使用本地 SOCKS 代理: $GOST_PROXY"
+          if [ -n "${NODE_LINK:-}" ]; then
+            echo "Playwright 使用 socks5://127.0.0.1:1080"
           else
-            echo "直连（无 GOST_PROXY）"
+            echo "直连"
           fi
           npx playwright test
 
