@@ -1,7 +1,6 @@
 # optiklink
-
-Name	Secret
-HY2_LINK	hysteria2://密码@主机:443/?sni=xxx&insecure=1
-DISCORD_ACCOUNT	邮箱,密码
-PANEL_ACCOUNT	用户名,密码
-GOST_PROXY	socks5://user:pass@host:port
+🔑 Secret 名称	📝 格式	✅ 必填
+DISCORD_ACCOUNT	email,password	✅
+PANEL_ACCOUNT	username,password	✅
+TG_BOT	chat_id,bot_token	可选
+GOST_PROXY	socks5://user:pass@host:port	可选
