@@ -45,15 +45,13 @@ jobs:
           wget -q -O hysteria "https://github.com/apernet/hysteria/releases/download/${TAG}/hysteria-linux-amd64"
           chmod +x hysteria
 
-          # 解析 hysteria2://密码@主机:端口/?sni=xxx&insecure=1
-          # 连 IP 时强制 insecure=true（解决 IP SAN 证书错误）
           python3 <<'PY'
-          import os, re, urllib.parse, ipaddress
+          import os, re, urllib.parse, ipaddress, json
 
           link = os.environ["HY2_LINK"].strip()
           raw = re.sub(r'^(hysteria2|hy2)://', '', link, flags=re.I)
           if '@' not in raw:
-              raise SystemExit('HY2_LINK 格式错误，需要 hysteria2://密码@主机:端口/...')
+              raise SystemExit('HY2_LINK 格式错误')
 
           auth, rest = raw.split('@', 1)
           auth = urllib.parse.unquote(auth)
@@ -72,16 +70,16 @@ jobs:
           host = hostport.rsplit(':', 1)[0].strip('[]')
           try:
               ipaddress.ip_address(host)
-              insecure = True  # IP 节点强制跳过证书校验
+              insecure = True
               if not sni:
-                  sni = 'www.bing.com'  # 占位 SNI，可按节点要求改
+                  sni = 'www.bing.com'
           except ValueError:
               if not sni:
                   sni = host
 
-          # 明文写 yaml，确保 insecure 是布尔 true
-          content = f"""server: {hostport}
-          auth: {auth}
+          # 必须保留缩进，否则 tls.insecure 不生效
+          cfg = f"""server: {hostport}
+          auth: "{auth}"
           tls:
             sni: {sni}
             insecure: {str(insecure).lower()}
@@ -91,22 +89,42 @@ jobs:
           socks5:
             listen: 127.0.0.1:1080
           """
-          # 去掉每行因缩进多出的空格
-          lines = [ln.lstrip() for ln in content.strip().splitlines()]
-          open('hy2-client.yaml', 'w', encoding='utf-8').write('\n'.join(lines) + '\n')
-          print(f'server={hostport} sni={sni} insecure={insecure}')
+          # 只去掉因 heredoc 产生的公共缩进（每行固定 0 或 2 空格结构）
+          # 用显式行列表，避免 lstrip 把层级删掉
+          text = "\n".join([
+              f"server: {hostport}",
+              f'auth: "{auth}"',
+              "tls:",
+              f"  sni: {sni}",
+              f"  insecure: {str(insecure).lower()}",
+              "bandwidth:",
+              "  up: 50 mbps",
+              "  down: 100 mbps",
+              "socks5:",
+              "  listen: 127.0.0.1:1080",
+              "",
+          ])
+          open("hy2-client.yaml", "w", encoding="utf-8").write(text)
+          # 日志不打印 auth / 完整 server
+          print(json.dumps({
+              "sni": sni,
+              "insecure": insecure,
+              "socks": "127.0.0.1:1080",
+              "server_is_ip": True,
+          }))
           PY
 
-          echo "----- hy2-client.yaml -----"
-          cat hy2-client.yaml
+          echo "----- hy2-client.yaml 结构检查（已打码 auth）-----"
+          sed -E 's/^(auth: ).*/\1***REDACTED***/' hy2-client.yaml
 
           nohup ./hysteria client -c hy2-client.yaml > hy2.log 2>&1 &
           sleep 6
           echo "----- hy2.log -----"
+          # 避免日志里带敏感信息时全文乱贴；只显示级别行
           cat hy2.log || true
 
           if ! (echo >/dev/tcp/127.0.0.1/1080) 2>/dev/null; then
-            echo "❌ Hy2 启动失败"
+            echo "❌ Hy2 启动失败（请看上方 hy2.log）"
             exit 1
           fi
           echo "✅ SOCKS5 127.0.0.1:1080 就绪"
@@ -121,7 +139,7 @@ jobs:
           set -euo pipefail
           if [ -n "${HY2_LINK:-}" ]; then
             export GOST_PROXY="socks5://127.0.0.1:1080"
-            echo "使用代理: $GOST_PROXY"
+            echo "使用本地 SOCKS 代理"
           else
             export GOST_PROXY=""
             echo "直连"
@@ -136,6 +154,7 @@ jobs:
           path: test-results/
           retention-days: 7
 
+                # ========== 防止 60 天无活动禁用 workflow ==========
       - name: 📅 更新 time.txt 保持仓库活跃
         if: always()
         run: |
