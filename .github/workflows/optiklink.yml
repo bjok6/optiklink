@@ -29,115 +29,21 @@ jobs:
       - name: 🌐 安装 Playwright 浏览器
         run: npx playwright install chromium --with-deps
 
-      - name: 🛡️ 启动 Hysteria2（整段链接）
+      - name: ⚙ 设置代理 (sing-box)
         env:
-          HY2_LINK: ${{ secrets.HY2_LINK }}
+          NODE_LINK: ${{ secrets.NODE_LINK }}
         run: |
-          set -euo pipefail
-
-          if [ -z "${HY2_LINK:-}" ]; then
-            echo "未配置 HY2_LINK，跳过 Hy2"
-            exit 0
-          fi
-
-          TAG=$(curl -sL https://api.github.com/repos/apernet/hysteria/releases/latest | grep -oP '"tag_name":\s*"\K[^"]+' | head -1)
-          echo "Hysteria: $TAG"
-          wget -q -O hysteria "https://github.com/apernet/hysteria/releases/download/${TAG}/hysteria-linux-amd64"
-          chmod +x hysteria
-
-          python3 <<'PY'
-          import os, re, urllib.parse, ipaddress, json
-
-          link = os.environ["HY2_LINK"].strip()
-          raw = re.sub(r'^(hysteria2|hy2)://', '', link, flags=re.I)
-          if '@' not in raw:
-              raise SystemExit('HY2_LINK 格式错误')
-
-          auth, rest = raw.split('@', 1)
-          auth = urllib.parse.unquote(auth)
-
-          if '?' in rest:
-              hostport, query = rest.split('?', 1)
-          else:
-              hostport, query = rest, ''
-          hostport = hostport.split('/')[0].strip()
-
-          qs = urllib.parse.parse_qs(query)
-          sni = (qs.get('sni') or qs.get('peer') or [''])[0]
-          insecure_v = (qs.get('insecure') or ['0'])[0].lower()
-          insecure = insecure_v in ('1', 'true', 'yes')
-
-          host = hostport.rsplit(':', 1)[0].strip('[]')
-          try:
-              ipaddress.ip_address(host)
-              insecure = True
-              if not sni:
-                  sni = 'www.bing.com'
-          except ValueError:
-              if not sni:
-                  sni = host
-
-          # 必须保留缩进，否则 tls.insecure 不生效
-          cfg = f"""server: {hostport}
-          auth: "{auth}"
-          tls:
-            sni: {sni}
-            insecure: {str(insecure).lower()}
-          bandwidth:
-            up: 50 mbps
-            down: 100 mbps
-          socks5:
-            listen: 127.0.0.1:1080
-          """
-          # 只去掉因 heredoc 产生的公共缩进（每行固定 0 或 2 空格结构）
-          # 用显式行列表，避免 lstrip 把层级删掉
-          text = "\n".join([
-              f"server: {hostport}",
-              f'auth: "{auth}"',
-              "tls:",
-              f"  sni: {sni}",
-              f"  insecure: {str(insecure).lower()}",
-              "bandwidth:",
-              "  up: 50 mbps",
-              "  down: 100 mbps",
-              "socks5:",
-              "  listen: 127.0.0.1:1080",
-              "",
-          ])
-          open("hy2-client.yaml", "w", encoding="utf-8").write(text)
-          # 日志不打印 auth / 完整 server
-          print(json.dumps({
-              "sni": sni,
-              "insecure": insecure,
-              "socks": "127.0.0.1:1080",
-              "server_is_ip": True,
-          }))
-          PY
-
-          echo "----- hy2-client.yaml 结构检查（已打码 auth）-----"
-          sed -E 's/^(auth: ).*/\1***REDACTED***/' hy2-client.yaml
-
-          nohup ./hysteria client -c hy2-client.yaml > hy2.log 2>&1 &
-          sleep 6
-          echo "----- hy2.log -----"
-          # 避免日志里带敏感信息时全文乱贴；只显示级别行
-          cat hy2.log || true
-
-          if ! (echo >/dev/tcp/127.0.0.1/1080) 2>/dev/null; then
-            echo "❌ Hy2 启动失败（请看上方 hy2.log）"
-            exit 1
-          fi
-          echo "✅ SOCKS5 127.0.0.1:1080 就绪"
+          bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
 
       - name: 🚀 运行保活脚本
         env:
           DISCORD_ACCOUNT: ${{ secrets.DISCORD_ACCOUNT }}
           PANEL_ACCOUNT: ${{ secrets.PANEL_ACCOUNT }}
           TG_BOT: ${{ secrets.TG_BOT }}
-          HY2_LINK: ${{ secrets.HY2_LINK }}
+          NODE_LINK: ${{ secrets.NODE_LINK }}
         run: |
           set -euo pipefail
-          if [ -n "${HY2_LINK:-}" ]; then
+          if [ -n "${NODE_LINK:-}" ]; then
             export GOST_PROXY="socks5://127.0.0.1:1080"
             echo "使用本地 SOCKS 代理"
           else
