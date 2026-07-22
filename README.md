@@ -1,6 +1,1 @@
 # optiklink
-🔑 Secret 名称	📝 格式	✅ 必填
-DISCORD_ACCOUNT	email,password	✅
-PANEL_ACCOUNT	username,password	✅
-TG_BOT	chat_id,bot_token	可选
-GOST_PROXY	socks5://user:pass@host:port	可选
