@@ -81,156 +81,112 @@ function sendTG(result, serverName = 'OptikLink') {
 async function handleQuickVerification(page) {
     console.log('🔍 检查 OptikLink Quick Verification...');
 
-    try {
-        // 给 optiklink.com → optiklink.net 的跳转留一点时间
-        await page.waitForTimeout(1500);
+    // 最长等待 10 秒，让验证页面有时间加载
+    for (let i = 0; i < 20; i++) {
+        const bodyText = await page.locator('body').innerText().catch(() => '');
 
-        const bodyText = await page.locator('body')
-            .innerText()
-            .catch(() => '');
+        if (/Quick Verification/i.test(bodyText) &&
+            /What\s+is/i.test(bodyText)) {
 
-        // 没有数学验证，直接继续
-        if (!/Quick Verification|What\s+is/i.test(bodyText)) {
+            console.log('🧮 检测到 Quick Verification');
+
+            // 匹配类似：
+            // What is 3 + 2 ?
+            // What is 9 + 2 ?
+            // What is 12 * 3 ?
+            // What is 10 - 4 ?
+            // What is 20 / 5 ?
+            const match = bodyText.match(
+                /What\s+is\s*(-?\d+(?:\.\d+)?)\s*([+\-*/×÷xX])\s*(-?\d+(?:\.\d+)?)\s*\?/i
+            );
+
+            if (!match) {
+                throw new Error('检测到了 Quick Verification，但无法解析数学题');
+            }
+
+            const a = Number(match[1]);
+            const operator = match[2];
+            const b = Number(match[3]);
+
+            let answer;
+
+            switch (operator) {
+                case '+':
+                    answer = a + b;
+                    break;
+
+                case '-':
+                    answer = a - b;
+                    break;
+
+                case '*':
+                case '×':
+                case 'x':
+                case 'X':
+                    answer = a * b;
+                    break;
+
+                case '/':
+                case '÷':
+                    answer = a / b;
+                    break;
+
+                default:
+                    throw new Error(`未知运算符: ${operator}`);
+            }
+
+            console.log(`🧮 计算: ${a} ${operator} ${b} = ${answer}`);
+
+            const input = page.locator(
+                'input[type="number"], ' +
+                'input[name*="answer" i], ' +
+                'input[placeholder*="answer" i]'
+            ).first();
+
+            await input.waitFor({
+                state: 'visible',
+                timeout: 5000
+            });
+
+            await input.fill(String(answer));
+
+            console.log('📤 提交 Quick Verification...');
+
+            const continueBtn = page.getByRole('button', {
+                name: /CONTINUE\s+WITH\s+LOGIN/i
+            }).first();
+
+            await continueBtn.waitFor({
+                state: 'visible',
+                timeout: 5000
+            });
+
+            await continueBtn.click();
+
+            console.log('✅ Quick Verification 已提交');
+
+            // 等待验证页面消失
+            await page.waitForTimeout(1500);
+
+            return;
+        }
+
+        // 如果已经出现 Discord 登录入口，说明没有验证或者验证已经完成
+        const hasLogin = await page.locator(
+            'a[href*="discord"], ' +
+            'button:has-text("Discord"), ' +
+            'a:has-text("Discord")'
+        ).first().isVisible().catch(() => false);
+
+        if (hasLogin) {
             console.log('✅ 未检测到 Quick Verification');
             return;
         }
 
-        console.log('🧮 检测到 Quick Verification');
-
-        /*
-         * 支持：
-         *
-         * What is 9 + 2 ?
-         * What is 12 - 5 ?
-         * What is 6 * 3 ?
-         * What is 6 × 3 ?
-         * What is 20 / 4 ?
-         * What is 20 ÷ 4 ?
-         */
-
-        const match = bodyText.match(
-            /What\s+is\s*(-?\d+(?:\.\d+)?)\s*([+\-*/×÷xX])\s*(-?\d+(?:\.\d+)?)\s*\?/i
-        );
-
-        if (!match) {
-            throw new Error(
-                '无法识别数学题，请检查页面题目格式'
-            );
-        }
-
-        const a = Number(match[1]);
-        const op = match[2];
-        const b = Number(match[3]);
-
-        let answer;
-
-        switch (op) {
-            case '+':
-                answer = a + b;
-                break;
-
-            case '-':
-                answer = a - b;
-                break;
-
-            case '*':
-            case '×':
-            case 'x':
-            case 'X':
-                answer = a * b;
-                break;
-
-            case '/':
-            case '÷':
-                if (b === 0) {
-                    throw new Error('除数不能为 0');
-                }
-
-                answer = a / b;
-                break;
-
-            default:
-                throw new Error(
-                    `不支持的运算符：${op}`
-                );
-        }
-
-        // 避免浮点数出现 1.2000000000000002 这种情况
-        if (Number.isInteger(answer)) {
-            answer = String(answer);
-        } else {
-            answer = String(
-                Number(answer.toFixed(10))
-            );
-        }
-
-        console.log(
-            `🧮 数学题：${a} ${op} ${b} = ${answer}`
-        );
-
-        // 截图中的输入框是 number 类型
-        // 同时兼容可能存在的 answer 输入框
-        const input = page.locator(
-            [
-                'input[type="number"]',
-                'input[name*="answer" i]',
-                'input[placeholder*="answer" i]'
-            ].join(',')
-        ).first();
-
-        await input.waitFor({
-            state: 'visible',
-            timeout: 10000
-        });
-
-        await input.fill(answer);
-
-        console.log('📤 已填写数学答案');
-
-        // 查找 CONTINUE WITH LOGIN
-        const continueBtn = page.getByRole('button', {
-            name: /CONTINUE\s+WITH\s+LOGIN/i
-        }).first();
-
-        await continueBtn.waitFor({
-            state: 'visible',
-            timeout: 10000
-        });
-
-        await continueBtn.click();
-
-        console.log(
-            '📤 已点击 CONTINUE WITH LOGIN'
-        );
-
-        // 等待验证完成
-        await page.waitForTimeout(2000);
-
-        const currentUrl = page.url();
-
-        const afterText = await page.locator('body')
-            .innerText()
-            .catch(() => '');
-
-        // 如果点击后仍然停留在验证页面，说明提交失败
-        if (
-            /Quick Verification|What\s+is/i.test(afterText) &&
-            currentUrl.includes('optiklink')
-        ) {
-            throw new Error(
-                '数学验证提交后页面仍停留在 Quick Verification'
-            );
-        }
-
-        console.log(
-            `✅ Quick Verification 处理完成，当前：${currentUrl}`
-        );
-
-    } catch (e) {
-        throw new Error(
-            `Quick Verification 处理失败：${e.message}`
-        );
+        await page.waitForTimeout(500);
     }
+
+    console.log('ℹ️ 10 秒内未检测到 Quick Verification，继续登录流程');
 }
 
 
