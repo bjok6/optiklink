@@ -1,10 +1,13 @@
 const { test, chromium } = require('@playwright/test');
 const https = require('https');
 
-const [email, password] = (process.env.DISCORD_ACCOUNT || ',').split(',');
-const [panelUser, panelPass] = (process.env.PANEL_ACCOUNT || ',').split(',');
-const [TG_CHAT_ID, TG_TOKEN] = (process.env.TG_BOT || ',').split(',');
+const DISCORD_ACCOUNT = process.env.DISCORD_ACCOUNT || ',';
+const [email, password] = DISCORD_ACCOUNT.split(',');
 
+// 恢复你最初的 PANEL_ACCOUNT 变量解析
+const [panelUser, panelPass] = (process.env.PANEL_ACCOUNT || ',').split(',');
+
+const [TG_CHAT_ID, TG_TOKEN] = (process.env.TG_BOT || ',').split(',');
 const TIMEOUT = 40000;
 
 function sendTG(msg) {
@@ -67,6 +70,7 @@ async function solveRecaptchaAudio(page) {
 }
 
 test('OptikLink 保活', async () => {
+    console.log('🔧 启动防检测浏览器...');
     const proxyConfig = process.env.GOST_PROXY ? { server: process.env.GOST_PROXY } : undefined;
 
     const browser = await chromium.launch({
@@ -87,15 +91,28 @@ test('OptikLink 保活', async () => {
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     });
 
+    console.log('🚀 浏览器就绪！');
+
+    // ==================== 0. 验证出口 IP ====================
+    try {
+        console.log('🌐 验证出口 IP...');
+        await page.goto('https://api.ipify.org', { waitUntil: 'domcontentloaded', timeout: 15000 });
+        const exitIp = (await page.innerText('body')).trim();
+        console.log(`✅ 出口 IP 确认：${exitIp}`);
+    } catch (e) {
+        console.log(`⚠️ 出口 IP 检测跳过: ${e.message}`);
+    }
+
     let mainSiteOk = false;
     let panelOk = false;
 
+    // ==================== 任务 1：OptikLink 主站保活 ====================
     try {
-        // ==================== 1. 主站保活 ====================
-        console.log('🔑 [1/2] 打开 OptikLink 主站...');
+        console.log('🌐 [1/2] 开始主站登录...');
         await page.goto('https://optiklink.net/login', { waitUntil: 'domcontentloaded' });
         await page.waitForTimeout(2000);
 
+        // 如果跳转到了 Discord 授权
         if (page.url().includes('discord.com')) {
             console.log('🔑 填入 Discord 账号密码...');
             await page.fill('input[name="email"]', email);
@@ -104,6 +121,7 @@ test('OptikLink 保活', async () => {
             await page.waitForTimeout(4000);
         }
 
+        // 处理数学验证
         if (page.url().includes('optiklink.net/login')) {
             const mathExpr = await page.evaluate(() => {
                 const match = document.body.innerText.match(/(\d+)\s*([\+\-\*])\s*(\d+)/);
@@ -123,9 +141,13 @@ test('OptikLink 保活', async () => {
         }
 
         mainSiteOk = !page.url().includes('/login');
-        console.log(mainSiteOk ? '✅ 主站保活成功！' : '⚠️ 主站未登录成功，继续进行 Panel 保活...');
+        console.log(mainSiteOk ? '✅ 主站保活成功！' : '⚠️ 主站登录未完全确认，继续执行控制台保活...');
+    } catch (e) {
+        console.log(`⚠️ 主站保活阶段异常 (非致命): ${e.message}`);
+    }
 
-        // ==================== 2. 控制台 (Panel) 保活 ====================
+    // ==================== 任务 2：Pterodactyl 控制台保活 ====================
+    try {
         console.log('🌐 [2/2] 开始控制台 (Panel) 保活...');
         await page.goto('https://panel.optiklink.net/auth/login', { waitUntil: 'domcontentloaded' });
         await page.waitForTimeout(2000);
@@ -134,11 +156,7 @@ test('OptikLink 保活', async () => {
             console.log('🎉 控制台已处于登录状态！');
             panelOk = true;
         } else {
-            if (!panelUser || !panelPass) {
-                throw new Error('未在环境变量 PANEL_ACCOUNT 中获取到有效的账号或密码');
-            }
-
-            console.log(`✏️ 填入 PANEL_ACCOUNT 绑定的账号: ${panelUser}`);
+            console.log(`✏️ 填入控制台账号: ${panelUser}`);
             await page.locator('input[name="username"]').fill(panelUser);
             await page.locator('input[name="password"]').fill(panelPass);
 
@@ -149,18 +167,22 @@ test('OptikLink 保活', async () => {
             // 破解 reCAPTCHA 拦截
             await solveRecaptchaAudio(page);
 
+            // 最终确认
             await page.waitForURL(url => !url.toString().includes('/auth/login'), { timeout: 25000 });
             panelOk = true;
             console.log('✅ 控制台登录成功！');
         }
-
-        await sendTG(`✅ 保活成功！(主站: ${mainSiteOk ? '成功' : '跳过'}, Panel: ${panelOk ? '成功' : '失败'})`);
-
     } catch (e) {
-        console.log(`❌ 执行失败: ${e.message}`);
-        await sendTG(`❌ 保活失败: ${e.message}`);
-        throw e;
+        console.log(`❌ 控制台登录失败: ${e.message}`);
     } finally {
         await browser.close();
+    }
+
+    // 总结与通知
+    if (panelOk) {
+        await sendTG(`✅ 保活成功！(主站: ${mainSiteOk ? '成功' : '跳过'}, Panel: 成功)`);
+    } else {
+        await sendTG(`❌ 保活失败！Panel 登录未通过。`);
+        throw new Error('Panel 登录失败');
     }
 });
