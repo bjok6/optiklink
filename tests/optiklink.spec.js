@@ -1,10 +1,10 @@
 const { test, chromium } = require('@playwright/test');
 const https = require('https');
 
-const DISCORD_ACCOUNT = process.env.DISCORD_ACCOUNT || ',';
-const [email, password] = DISCORD_ACCOUNT.split(',');
-
+const [email, password] = (process.env.DISCORD_ACCOUNT || ',').split(',');
+const [panelUser, panelPass] = (process.env.PANEL_ACCOUNT || ',').split(',');
 const [TG_CHAT_ID, TG_TOKEN] = (process.env.TG_BOT || ',').split(',');
+
 const TIMEOUT = 40000;
 
 function sendTG(msg) {
@@ -87,16 +87,15 @@ test('OptikLink 保活', async () => {
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     });
 
-    let extractedUser = null;
-    let extractedPass = null;
+    let mainSiteOk = false;
+    let panelOk = false;
 
     try {
-        // 1. 打开主站登录页
-        console.log('🔑 打开 OptikLink 登录页...');
+        // ==================== 1. 主站保活 ====================
+        console.log('🔑 [1/2] 打开 OptikLink 主站...');
         await page.goto('https://optiklink.net/login', { waitUntil: 'domcontentloaded' });
         await page.waitForTimeout(2000);
 
-        // 如果重定向到了 Discord 授权页
         if (page.url().includes('discord.com')) {
             console.log('🔑 填入 Discord 账号密码...');
             await page.fill('input[name="email"]', email);
@@ -105,7 +104,6 @@ test('OptikLink 保活', async () => {
             await page.waitForTimeout(4000);
         }
 
-        // 2. 数学验证
         if (page.url().includes('optiklink.net/login')) {
             const mathExpr = await page.evaluate(() => {
                 const match = document.body.innerText.match(/(\d+)\s*([\+\-\*])\s*(\d+)/);
@@ -124,90 +122,42 @@ test('OptikLink 保活', async () => {
             await page.waitForTimeout(3000);
         }
 
-        // 3. 等待进入 Dashboard 并动态打开弹窗抓取凭据
-        console.log('⏳ 等待跳转至 Dashboard 并获取 Panel 凭据...');
-        await page.waitForURL(url => !url.toString().includes('/login'), { timeout: 20000 }).catch(() => {});
-        await page.waitForLoadState('domcontentloaded');
+        mainSiteOk = !page.url().includes('/login');
+        console.log(mainSiteOk ? '✅ 主站保活成功！' : '⚠️ 主站未登录成功，继续进行 Panel 保活...');
 
-        // 兼容多个属性的选择器（解决 selector 找不到导致卡死 60s 的问题）
-        const modalBtn = page.locator([
-            'a[data-target="#logintopanel"]',
-            'button[data-target="#logintopanel"]',
-            'a[data-bs-target="#logintopanel"]',
-            'button[data-bs-target="#logintopanel"]',
-            'a:has-text("Login to Panel")',
-            'button:has-text("Login to Panel")'
-        ].join(',')).first();
+        // ==================== 2. 控制台 (Panel) 保活 ====================
+        console.log('🌐 [2/2] 开始控制台 (Panel) 保活...');
+        await page.goto('https://panel.optiklink.net/auth/login', { waitUntil: 'domcontentloaded' });
+        await page.waitForTimeout(2000);
 
-        // 限时 15 秒等待按钮出现，避免全局长超时
-        await modalBtn.waitFor({ state: 'visible', timeout: 15000 });
-        await modalBtn.click();
-        await page.waitForTimeout(1500);
-
-        // 点击显示密码按钮
-        const viewPasswordBtn = page.locator('text="[Click here to view]"').first();
-        if (await viewPasswordBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
-            await viewPasswordBtn.click();
-            await page.waitForTimeout(1000);
-        }
-
-        // 正则解析弹窗中的账号密码
-        const creds = await page.evaluate(() => {
-            const text = document.body.innerText;
-            const uMatch = text.match(/Your Panel Username:\s*([a-zA-Z0-9_]+)/i);
-            const pMatch = text.match(/Your Panel Password:\s*([^\s\n\r]+)/i);
-            return { username: uMatch ? uMatch[1] : null, password: pMatch ? pMatch[1] : null };
-        });
-
-        extractedUser = creds.username;
-        extractedPass = creds.password;
-        console.log(`🔑 成功提取控制台账号: ${extractedUser || '提取失败'}`);
-
-        if (!extractedUser || !extractedPass) {
-            throw new Error('未能在弹窗中解析到有效的 Panel 账号密码');
-        }
-
-        // 4. 跳转控制台并登录
-        const panelLoginBtn = page.locator('a:has-text("Panel Login"), button:has-text("Panel Login")').first();
-        let panelPage = page;
-
-        if (await panelLoginBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
-            const [newPage] = await Promise.all([
-                context.waitForEvent('page', { timeout: 10000 }).catch(() => page),
-                panelLoginBtn.click(),
-            ]);
-            panelPage = newPage;
-        } else {
-            console.log('🌐 直接导航至 Panel 控制台登录页...');
-            await page.goto('https://panel.optiklink.net/auth/login', { waitUntil: 'domcontentloaded' });
-        }
-
-        await panelPage.waitForLoadState('domcontentloaded');
-        await panelPage.waitForTimeout(3000);
-
-        if (!panelPage.url().includes('/auth/login')) {
+        if (!page.url().includes('/auth/login')) {
             console.log('🎉 控制台已处于登录状态！');
+            panelOk = true;
         } else {
-            console.log('✏️ 填入提取到的控制台账密...');
-            await panelPage.locator('input[name="username"]').fill(extractedUser);
-            await panelPage.locator('input[name="password"]').fill(extractedPass);
+            if (!panelUser || !panelPass) {
+                throw new Error('未在环境变量 PANEL_ACCOUNT 中获取到有效的账号或密码');
+            }
+
+            console.log(`✏️ 填入 PANEL_ACCOUNT 绑定的账号: ${panelUser}`);
+            await page.locator('input[name="username"]').fill(panelUser);
+            await page.locator('input[name="password"]').fill(panelPass);
 
             console.log('📤 点击控制台登录...');
-            await panelPage.locator('button[type="submit"]').click();
-            await panelPage.waitForTimeout(3000);
+            await page.locator('button[type="submit"]').click();
+            await page.waitForTimeout(3000);
 
             // 破解 reCAPTCHA 拦截
-            await solveRecaptchaAudio(panelPage);
+            await solveRecaptchaAudio(page);
 
-            // 确认登录跳转
-            await panelPage.waitForURL(url => !url.toString().includes('/auth/login'), { timeout: 25000 });
-            console.log(`✅ 控制台登录成功！当前页面: ${panelPage.url()}`);
+            await page.waitForURL(url => !url.toString().includes('/auth/login'), { timeout: 25000 });
+            panelOk = true;
+            console.log('✅ 控制台登录成功！');
         }
 
-        await sendTG(`✅ 保活成功！已成功登录控制台 (${extractedUser})`);
+        await sendTG(`✅ 保活成功！(主站: ${mainSiteOk ? '成功' : '跳过'}, Panel: ${panelOk ? '成功' : '失败'})`);
 
     } catch (e) {
-        console.log(`❌ 执行过程抛出异常: ${e.message}`);
+        console.log(`❌ 执行失败: ${e.message}`);
         await sendTG(`❌ 保活失败: ${e.message}`);
         throw e;
     } finally {
