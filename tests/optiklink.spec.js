@@ -125,49 +125,61 @@ async function transcribeAudio(page, audioUrl) {
     }
 }
 
-// 🤖 2. reCAPTCHA 自动语音识别求解
+// 🤖 2. reCAPTCHA 自动处理：先等勾选框并尝试自动通过，失败再走语音质询
 async function solveRecaptchaAudio(page) {
     try {
         console.log('🔍 正在检测 reCAPTCHA 验证码...');
-        const recaptchaFrame = page.frames().find(f => f.url().includes('api2/anchor') || f.url().includes('enterprise/anchor'));
-        if (!recaptchaFrame) {
-            console.log('ℹ️ 未检测到可见的 reCAPTCHA 框架');
-            return;
+        const frames = page.frames();
+        const frameUrls = frames.map(f => f.url()).filter(Boolean).join(' | ');
+        console.log('ℹ️ 当前 iframe: ' + (frameUrls || '(无)'));
+
+        // 1) 等 reCAPTCHA 勾选框渲染出来（最多 10 秒）；可见则点击，期望直接通过
+        let anchorFrame = null;
+        for (let i = 0; i < 10 && !anchorFrame; i++) {
+            anchorFrame = page.frames().find(f => /(api2|enterprise)\/anchor/.test(f.url()));
+            if (!anchorFrame) await page.waitForTimeout(1000);
+        }
+        if (!anchorFrame) {
+            console.log('ℹ️ 10 秒内未见 reCAPTCHA anchor 框架');
+            return false;
         }
 
-        const checkbox = recaptchaFrame.locator('#recaptcha-anchor');
-        if (await checkbox.isVisible()) {
+        const checkbox = anchorFrame.locator('#recaptcha-anchor');
+        if (await checkbox.isVisible().catch(() => false)) {
             console.log('🤖 点击 reCAPTCHA 人机身份验证复选框...');
             await checkbox.click({ force: true });
             await page.waitForTimeout(2500);
+            const isChecked = await anchorFrame.locator('.recaptcha-checkbox-checked').count().catch(() => 0) > 0;
+            if (isChecked) {
+                console.log('✅ reCAPTCHA 自动通过（无图片/语音质询）');
+                return true;
+            }
+        } else {
+            console.log('ℹ️ 勾选框不可见（可能是 invisible 模式，提交后才会弹出质询）');
         }
 
-        const isChecked = await recaptchaFrame.locator('.recaptcha-checkbox-checked').count() > 0;
-        if (isChecked) {
-            console.log('✅ reCAPTCHA 自动通过（无图片/语音质询）');
-            return;
+        // 2) 若已有弹出的质询，尝试语音求解
+        const challengeFrame = page.frames().find(f => /(api2|enterprise)\/bframe/.test(f.url()));
+        if (!challengeFrame) {
+            console.log('ℹ️ 暂无可见质询，等待提交后触发');
+            return false;
         }
-
-        const challengeFrame = page.frames().find(f => f.url().includes('api2/bframe') || f.url().includes('enterprise/bframe'));
-        if (!challengeFrame) return;
 
         const audioBtn = challengeFrame.locator('#recaptcha-audio-button');
-        if (await audioBtn.isVisible().catch(() => false)) {
-            console.log('🎙️ 点击语音验证码模式...');
-            // force: true 穿透背景遮罩层的拦截
-            await audioBtn.click({ force: true });
-        } else {
-            console.log('ℹ️ 未找到语音模式入口，跳过 reCAPTCHA 处理');
-            return;
+        if (!(await audioBtn.isVisible().catch(() => false))) {
+            console.log('ℹ️ 未找到语音模式入口，跳过语音处理');
+            return false;
         }
+        console.log('🎙️ 点击语音验证码模式...');
+        await audioBtn.click({ force: true });
 
-        // 等待语音面板真正出现（最多 8 秒），不要用默认 60 秒超时
+        // 等待语音面板出现（最多 8 秒），不要用默认 60 秒超时
         const audioSource = challengeFrame.locator('#audio-source').first();
         try {
             await audioSource.waitFor({ state: 'attached', timeout: 8000 });
         } catch {
-            console.log('⚠️ 语音质询未能加载，跳过 reCAPTCHA 处理');
-            return;
+            console.log('⚠️ 语音质询未能加载（#audio-source 未出现），跳过语音处理');
+            return false;
         }
 
         // 错误提示用 1.5 秒短探测；正常打开语音质询时不会出现该元素
@@ -176,7 +188,7 @@ async function solveRecaptchaAudio(page) {
             .first().innerText({ timeout: 1500 }).catch(() => '');
         if (errNotice.includes('automated queries') || errNotice.includes('自动查询')) {
             console.log('⚠️ reCAPTCHA 触发 IP 频控或机器人防御机制');
-            return;
+            return false;
         }
 
         // 音频地址先取 src，失败再退回取 href，各 3 秒
@@ -186,8 +198,8 @@ async function solveRecaptchaAudio(page) {
                 .first().getAttribute('href', { timeout: 3000 }).catch(() => null);
         }
         if (!audioLink) {
-            console.log('⚠️ 未取到语音下载地址，跳过 reCAPTCHA 处理');
-            return;
+            console.log('⚠️ 未取到语音下载地址，跳过语音处理');
+            return false;
         }
 
         console.log('📥 正在下载语音验证码并进行 STT 识别...');
@@ -197,12 +209,14 @@ async function solveRecaptchaAudio(page) {
             await challengeFrame.locator('#audio-response').fill(transcript);
             await challengeFrame.locator('#recaptcha-verify-button').click({ force: true });
             await page.waitForTimeout(2500);
-            console.log('✅ reCAPTCHA 语音验证码已成功提交！');
-        } else {
-            console.log('⚠️ 语音识别未返回有效内容');
+            console.log('✅ reCAPTCHA 语音验证码已提交！');
+            return true;
         }
+        console.log('⚠️ 语音识别未返回有效内容');
+        return false;
     } catch (e) {
         console.log(`ℹ️ reCAPTCHA 处理抛出异常: ${e.message}`);
+        return false;
     }
 }
 
@@ -422,32 +436,51 @@ test('OptikLink 保活', async ({ }, testInfo) => {
             // 控制台 reCAPTCHA 语音处理 (如果有可见质询)
             await solveRecaptchaAudio(page);
 
-            // 加入错误检测与重试机制，防止遇到 "This recaptcha instance did not render yet."
+            // 重试机制：提交后若才弹出验证码质询则再解一次再重提，
+            // 同时避免 "This recaptcha instance did not render yet." 的拦截
             let loginSuccess = false;
+            let triedSolveAgain = false;
             for (let i = 0; i < 3; i++) {
                 console.log(`📤 提交控制台登录 (尝试 ${i + 1}/3)...`);
-                await page.click('button[type="submit"]');
+                try {
+                    await page.click('button[type="submit"]', { timeout: 5000 });
+                } catch {
+                    console.log('⚠️ 提交按钮暂时不可点击（可能被验证码弹层遮挡），等待 2 秒重试');
+                    await page.waitForTimeout(2000);
+                    continue;
+                }
 
                 try {
-                    // 等待 URL 变化脱离 login 页面
                     await page.waitForURL(url => !url.toString().includes('/auth/login'), { timeout: 6000 });
                     loginSuccess = true;
                     break;
-                } catch {
-                    // 如果超时没跳转，检查页面是不是飘红报未渲染的错了
-                    const errorVisible = await page.getByText('recaptcha instance did not render yet', { exact: false }).isVisible().catch(() => false);
-                    if (errorVisible) {
-                        console.log('⚠️ 被拦截：reCAPTCHA 尚未在底层渲染完成，等待 5 秒后重试...');
-                        await page.waitForTimeout(5000);
-                    } else {
-                        break;
-                    }
+                } catch { /* 没跳转说明登录被拒，继续排查 */ }
+
+                // invisible 模式常见：提交后才弹出质询。出现质询则尝试自动解一次再重新提交
+                const hasChallenge = page.frames().some(f => /(api2|enterprise)\/bframe/.test(f.url()));
+                if (hasChallenge && !triedSolveAgain) {
+                    console.log('🔍 提交后检测到验证码质询，尝试自动求解...');
+                    await page.waitForTimeout(1500);
+                    await solveRecaptchaAudio(page);
+                    triedSolveAgain = true;
+                    continue;
+                }
+
+                const errorVisible = await page.getByText('recaptcha instance did not render yet', { exact: false }).isVisible().catch(() => false);
+                if (errorVisible) {
+                    console.log('⚠️ 被拦截：reCAPTCHA 尚未在底层渲染完成，等待 5 秒后重试...');
+                    await page.waitForTimeout(5000);
+                } else {
+                    break;
                 }
             }
 
             if (!loginSuccess) {
-                 console.log('⏳ 做最后一次跳转确认...');
-                 await page.waitForURL(url => !url.toString().includes('/auth/login'), { timeout: 15000, waitUntil: 'domcontentloaded' });
+                // 明确报错，而不是用 waitForURL 抛难懂的 TimeoutError
+                const bodyText = await page.locator('body').innerText({ timeout: 3000 }).catch(() => '');
+                const errLine = (bodyText.match(/[^\n]*(error|invalid|incorrect|错误|失败|验证|用户名|密码)[^\n]*/i) || [])[0];
+                const hint = errLine ? errLine.trim().slice(0, 200) : '页面无明确错误提示';
+                throw new Error(`❌ 控制台登录失败：仍停留在登录页（reCAPTCHA 未通过或账号密码有误）。提示：${hint}`);
             }
             console.log(`✅ 控制台登录成功！当前：${page.url()}`);
         } else {
