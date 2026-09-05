@@ -141,25 +141,71 @@ test('OptikLink 保活', async ({ }, testInfo) => {
         await page.waitForTimeout(3000);
 
         // ==================== 提取 Panel 密码与跳转 ====================
-        const panelModalTrigger = page.locator('a[data-target="#logintopanel"], button[data-target="#logintopanel"]').first();
-        await panelModalTrigger.click();
-        await page.waitForTimeout(1500);
+// ==================== 4. 等待跳转至 Dashboard 并点击 Panel 弹窗 ====================
+        console.log('⏳ 等待页面跳转至 Dashboard...');
+        // 确保页面已不在 login 路径，或显式等待 Dashboard 关键元素
+        await page.waitForURL(url => !url.toString().includes('/login'), { timeout: 30000 }).catch(() => {});
+        await page.waitForLoadState('domcontentloaded');
 
+        console.log('📤 寻找并打开 Login to Panel 弹窗...');
+        
+        // 兼容 Bootstrap 4、Bootstrap 5 及文本匹配的多重选择器
+        const panelModalTrigger = page.locator([
+            'a[data-target="#logintopanel"]',
+            'button[data-target="#logintopanel"]',
+            'a[data-bs-target="#logintopanel"]',
+            'button[data-bs-target="#logintopanel"]',
+            'a:has-text("Login to Panel")',
+            'button:has-text("Login to Panel")'
+        ].join(',')).first();
+
+        // 等待元素可见再点击，若找不到则直接寻找页面上的控制台信息
+        try {
+            await panelModalTrigger.waitFor({ state: 'visible', timeout: 15000 });
+            await panelModalTrigger.click();
+            await page.waitForTimeout(1500);
+        } catch (e) {
+            console.log('⚠️ 未找到 Panel 弹窗按钮，尝试直接解析当前页面...');
+        }
+
+        // ==================== 5. 提取 Panel 用户名与密码 ====================
         const viewPasswordBtn = page.locator('text="[Click here to view]"').first();
-        if (await viewPasswordBtn.isVisible().catch(() => false)) await viewPasswordBtn.click();
+        if (await viewPasswordBtn.isVisible().catch(() => false)) {
+            await viewPasswordBtn.click();
+            await page.waitForTimeout(1000);
+        }
 
         const credentials = await page.evaluate(() => {
             const text = document.body.innerText;
             const uMatch = text.match(/Your Panel Username:\s*([a-zA-Z0-9_]+)/i);
             const pMatch = text.match(/Your Panel Password:\s*([^\s\n\r]+)/i);
-            return { username: uMatch ? uMatch[1] : null, password: pMatch ? pMatch[1] : null };
+            return { 
+                username: uMatch ? uMatch[1] : null, 
+                password: pMatch ? pMatch[1] : null 
+            };
         });
 
-        const panelLoginBtn = page.locator('a:has-text("Panel Login"), button:has-text("Panel Login")').first();
+        console.log(`🔑 成功获取控制台账号: ${credentials.username || '未获取到'}`);
+
+        // ==================== 6. 跳转控制台 ====================
+        const panelLoginBtn = page.locator([
+            'a:has-text("Panel Login")',
+            'button:has-text("Panel Login")',
+            'a[href*="/auth/login"]'
+        ].join(',')).first();
+
         const [panelPage] = await Promise.all([
-            context.waitForEvent('page').catch(() => page),
-            panelLoginBtn.click(),
+            context.waitForEvent('page', { timeout: 15000 }).catch(() => page),
+            panelLoginBtn.click().catch(async () => {
+                // 若未找到跳转按钮，直接访问控制台默认登录页
+                await page.goto('https://panel.optiklink.net/auth/login', { waitUntil: 'domcontentloaded' });
+                return page;
+            }),
         ]);
+
+        activePage = panelPage;
+        await panelPage.waitForLoadState('domcontentloaded');
+        await panelPage.waitForTimeout(3000);
 
         activePage = panelPage;
         await panelPage.waitForLoadState('domcontentloaded');
