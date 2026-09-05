@@ -331,14 +331,13 @@ test('OptikLink 保活', async ({ }, testInfo) => {
 
         console.log('✅ Discord OAuth 完成！');
 
-        // ==================== 1-5. 跳到 optiklink.net/login 并执行 Quick Verification ====================
+        // ==================== Quick Verification 数学验证 ====================
         console.log('🌐 1. 跳转到 https://optiklink.net/login ...');
         await page.goto('https://optiklink.net/login', { waitUntil: 'domcontentloaded' });
 
         console.log('🧮 2. 开始执行 Quick Verification 数学验证...');
         await page.waitForTimeout(2000);
 
-        // 智能获取页面上的算术表达式 (如 "12 + 5" / "8 - 3" / "5 * 4")
         const mathExpr = await page.evaluate(() => {
             const text = document.body.innerText;
             const match = text.match(/(\d+)\s*([\+\-\*])\s*(\d+)/);
@@ -361,7 +360,6 @@ test('OptikLink 保活', async ({ }, testInfo) => {
 
             console.log(`💡 计算验证题: ${mathExpr.full} = ${result}`);
 
-            // 定位验证输入框并填入结果
             const inputLoc = page.locator('input[type="number"], input[name*="captcha" i], input[name*="answer" i], input[placeholder*="answer" i], input[type="text"]').first();
             await inputLoc.waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
             if (await inputLoc.isVisible()) {
@@ -372,7 +370,6 @@ test('OptikLink 保活', async ({ }, testInfo) => {
             console.log('ℹ️ 未在当前页面检测到明确的数学算式，尝试直接寻找提交按钮');
         }
 
-        // 3. 点击 CONTINUE WITH LOGIN
         console.log('📤 3. 点击 CONTINUE WITH LOGIN...');
         const continueBtn = page.getByRole('button', { name: /CONTINUE WITH LOGIN/i })
             .or(page.locator('button:has-text("CONTINUE WITH LOGIN")'))
@@ -388,15 +385,14 @@ test('OptikLink 保活', async ({ }, testInfo) => {
             if (await genericBtn.isVisible()) await genericBtn.click();
         }
 
-        // 4. 等待页面继续跳转
         console.log('⏳ 4. 等待页面跳转...');
         await page.waitForTimeout(3000);
         try {
             await page.waitForURL(url => !url.toString().includes('/login'), { timeout: 20000 });
-        } catch { /* 如果已完成跳转则继续 */ }
+        } catch { /* 继续 */ }
         console.log(`✅ 当前页面 URL: ${page.url()}`);
 
-        // ==================== 6. 然后再找 Login to Panel ====================
+        // ==================== Login to Panel 阶段 ====================
         console.log('📤 5. 点击 Login to Panel...');
         const panelModalTrigger = page.locator('a[data-target="#logintopanel"], button[data-target="#logintopanel"], a:has-text("Login to Panel")').first();
         await panelModalTrigger.waitFor({ state: 'visible', timeout: 10000 });
@@ -415,7 +411,7 @@ test('OptikLink 保活', async ({ }, testInfo) => {
         panelPage.setDefaultTimeout(TIMEOUT);
         activePage = panelPage;
         console.log('⏳ 等待控制台页面加载...');
-        await panelPage.waitForURL(/control\.optiklink\.net/, { timeout: TIMEOUT, waitUntil: 'domcontentloaded' });
+        await panelPage.waitForURL(/control\.optiklink\.net/, { timeout: TIMEOUT });
 
         const currentUrl = panelPage.url();
         console.log(`✅ 已到达控制台页面：${currentUrl}`);
@@ -425,17 +421,46 @@ test('OptikLink 保活', async ({ }, testInfo) => {
             await panelPage.fill('input[name="username"]', panelUser);
             await panelPage.fill('input[name="password"]', panelPass);
 
-            console.log('⏳ 等待 reCAPTCHA 加载...');
-            await panelPage.waitForFunction(() => {
-                return typeof grecaptcha !== 'undefined' && grecaptcha.getResponse !== undefined;
-            }, { timeout: 15000 }).catch(() => console.log('  ℹ️ reCAPTCHA 未检测到，继续...'));
-            await panelPage.waitForTimeout(2000);
+            console.log('⏳ 检查 reCAPTCHA...');
+            await panelPage.evaluate(() => {
+                try {
+                    if (typeof grecaptcha !== 'undefined' && grecaptcha.execute) {
+                        grecaptcha.execute();
+                    }
+                } catch (e) {}
+            });
+            await panelPage.waitForTimeout(1500);
 
             console.log('📤 提交控制台登录...');
             await panelPage.click('button[type="submit"]');
 
             console.log('⏳ 确认到达控制台首页...');
-            await panelPage.waitForURL(url => !url.toString().includes('/auth/login'), { timeout: TIMEOUT, waitUntil: 'domcontentloaded' });
+            
+            // 适用于 React SPA 的无阻塞轮询判断与报错捕获
+            let loginSuccess = false;
+            for (let i = 0; i < 30; i++) {
+                await panelPage.waitForTimeout(1000);
+                const u = panelPage.url();
+                if (!u.includes('/auth/login')) {
+                    loginSuccess = true;
+                    break;
+                }
+                
+                // 检查页面是否有报错提示（如密码错误/验证码未过）
+                const errText = await panelPage.evaluate(() => {
+                    const el = document.querySelector('[class*="Error"]', '[class*="alert"]', '.text-red-500');
+                    return el ? el.innerText.trim() : '';
+                }).catch(() => '');
+                
+                if (errText) {
+                    throw new Error(`❌ 控制台登录失败，页面报错: ${errText}`);
+                }
+            }
+
+            if (!loginSuccess) {
+                throw new Error('❌ 控制台登录超时：表单已提交但未完成 SPA 跳转，请检查控制台账号密码或 reCAPTCHA 限制');
+            }
+
             console.log(`✅ 控制台登录成功！当前：${panelPage.url()}`);
         } else {
             console.log('ℹ️ 检测到已不在登录页，可能已自动鉴权并跳转至首页...');
