@@ -3,7 +3,6 @@ const { test, chromium } = require('@playwright/test');
 const https = require('https');
 
 const [email, password] = (process.env.DISCORD_ACCOUNT || ',').split(',');
-const [panelUser, panelPass] = (process.env.PANEL_ACCOUNT || ',').split(',');
 const [TG_CHAT_ID, TG_TOKEN] = (process.env.TG_BOT || ',').split(',');
 
 const TIMEOUT = 60000;
@@ -60,20 +59,6 @@ function sendTG(result, serverName = 'OptikLink') {
         req.write(body);
         req.end();
     });
-}
-
-// 处理 Discord 登录页（填账密）
-async function handleDiscordLogin(page, email, password) {
-    await page.fill('input[name="email"]', email);
-    await page.fill('input[name="password"]', password);
-    await page.click('button[type="submit"]');
-    try {
-        await page.waitForURL(url => !url.toString().includes('discord.com/login'), { timeout: 15000 });
-    } catch {
-        let err = '账密错误或触发了 2FA / 验证码';
-        try { err = await page.locator('[class*="errorMessage"]').first().innerText(); } catch {}
-        throw new Error(`❌ Discord 登录失败: ${err}`);
-    }
 }
 
 // 处理 Discord OAuth 授权页
@@ -308,7 +293,6 @@ test('OptikLink 保活', async ({ }, testInfo) => {
             if (e.message.includes('Discord 登录失败')) throw e;
         }
 
-        // 二次重定向登录检查
         if (page.url().includes('discord.com/login')) {
             console.log('🔄 OAuth 后被重定向至登录页，再次填写账号密码...');
             await page.fill('input[name="email"]', email);
@@ -392,79 +376,47 @@ test('OptikLink 保活', async ({ }, testInfo) => {
         } catch { /* 继续 */ }
         console.log(`✅ 当前页面 URL: ${page.url()}`);
 
-        // ==================== Login to Panel 阶段 ====================
-        console.log('📤 5. 点击 Login to Panel...');
+        // ==================== 点击 Panel Login 走 SSO 自动登录 ====================
+        console.log('📤 5. 点击 Login to Panel 弹窗...');
         const panelModalTrigger = page.locator('a[data-target="#logintopanel"], button[data-target="#logintopanel"], a:has-text("Login to Panel")').first();
         await panelModalTrigger.waitFor({ state: 'visible', timeout: 10000 });
         await panelModalTrigger.click();
-        await page.waitForTimeout(2000);
+        await page.waitForTimeout(1500);
 
-        console.log('📤 点击 Panel Login...');
-        const panelLoginBtn = page.getByRole('button', { name: 'Panel Login' });
+        console.log('📤 6. 点击 Panel Login 按钮发起 SSO 登录...');
+        const panelLoginBtn = page.getByRole('button', { name: 'Panel Login' })
+            .or(page.locator('a:has-text("Panel Login")'))
+            .or(page.locator('button:has-text("Panel Login")'))
+            .first();
+
         await panelLoginBtn.waitFor({ state: 'visible' });
 
         const [panelPage] = await Promise.all([
-            page.context().waitForEvent('page'),
+            page.context().waitForEvent('page').catch(() => page),
             panelLoginBtn.click(),
         ]);
 
         panelPage.setDefaultTimeout(TIMEOUT);
         activePage = panelPage;
-        console.log('⏳ 等待控制台页面加载...');
-        await panelPage.waitForURL(/control\.optiklink\.net/, { timeout: TIMEOUT });
 
-        const currentUrl = panelPage.url();
-        console.log(`✅ 已到达控制台页面：${currentUrl}`);
-
-        if (currentUrl.includes('/auth/login')) {
-            console.log('✏️ 填写控制台账号密码...');
-            await panelPage.fill('input[name="username"]', panelUser);
-            await panelPage.fill('input[name="password"]', panelPass);
-
-            console.log('⏳ 检查 reCAPTCHA...');
-            await panelPage.evaluate(() => {
-                try {
-                    if (typeof grecaptcha !== 'undefined' && grecaptcha.execute) {
-                        grecaptcha.execute();
-                    }
-                } catch (e) {}
-            });
-            await panelPage.waitForTimeout(1500);
-
-            console.log('📤 提交控制台登录...');
-            await panelPage.click('button[type="submit"]');
-
-            console.log('⏳ 确认到达控制台首页...');
-            
-            // 适用于 React SPA 的无阻塞轮询判断与报错捕获
-            let loginSuccess = false;
-            for (let i = 0; i < 30; i++) {
-                await panelPage.waitForTimeout(1000);
-                const u = panelPage.url();
-                if (!u.includes('/auth/login')) {
-                    loginSuccess = true;
-                    break;
-                }
-                
-                // 检查页面是否有报错提示（如密码错误/验证码未过）
-                const errText = await panelPage.evaluate(() => {
-                    const el = document.querySelector('[class*="Error"]', '[class*="alert"]', '.text-red-500');
-                    return el ? el.innerText.trim() : '';
-                }).catch(() => '');
-                
-                if (errText) {
-                    throw new Error(`❌ 控制台登录失败，页面报错: ${errText}`);
-                }
+        console.log('⏳ 7. 等待 SSO 自动完成重定向与鉴权...');
+        
+        // 循环等待控制台自动鉴权，不再填账号密码
+        let ssoLoggedIn = false;
+        for (let i = 0; i < 25; i++) {
+            await panelPage.waitForTimeout(1000);
+            const currentUrl = panelPage.url();
+            if (currentUrl.includes('control.optiklink.net') && !currentUrl.includes('/auth/login')) {
+                ssoLoggedIn = true;
+                break;
             }
-
-            if (!loginSuccess) {
-                throw new Error('❌ 控制台登录超时：表单已提交但未完成 SPA 跳转，请检查控制台账号密码或 reCAPTCHA 限制');
-            }
-
-            console.log(`✅ 控制台登录成功！当前：${panelPage.url()}`);
-        } else {
-            console.log('ℹ️ 检测到已不在登录页，可能已自动鉴权并跳转至首页...');
         }
+
+        if (!ssoLoggedIn) {
+            throw new Error(`❌ SSO 授权跳转超时，控制台仍停留在登录页：${panelPage.url()}`);
+        }
+
+        console.log(`✅ SSO 授权成功！当前已到达控制台：${panelPage.url()}`);
 
         await panelPage.waitForTimeout(2000);
 
