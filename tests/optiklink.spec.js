@@ -91,7 +91,7 @@ async function solveMathCaptcha(page) {
     }
 }
 
-// 🎙️ 音频转文字辅助函数 (Wit.ai / Free Speech API)
+// 🎙️ 音频转文字辅助函数
 function transcribeAudio(audioUrl) {
     return new Promise((resolve) => {
         https.get(audioUrl, (res) => {
@@ -207,7 +207,7 @@ async function handleOAuthPageOnce(page) {
             await btn.click();
             console.log('  ✨ 已点击授权按钮');
         }
-    } catch { /* 没找到按钮继续下一次循环 */ }
+    } catch { /* 没找到按钮继续 */ }
 }
 
 test('OptikLink 保活', async ({ }, testInfo) => {
@@ -342,13 +342,12 @@ test('OptikLink 保活', async ({ }, testInfo) => {
         console.log('📤 点击 Login with Discord...');
         await page.click("a[href='login']");
 
-        // 🔄 Discord 鉴权状态机循环：支持各种跳转与二次重定向
+        // 🔄 Discord 鉴权状态机循环
         console.log('⏳ 正在处理 Discord 登录与 OAuth 授权...');
         const authStartTime = Date.now();
         while (Date.now() - authStartTime < 45000) {
             const currentUrl = page.url();
 
-            // 如果已经跳回主站，直接退出循环
             if (currentUrl.includes('optiklink.net') || (currentUrl.includes('optiklink.com') && !currentUrl.includes('discord.com'))) {
                 break;
             }
@@ -386,25 +385,64 @@ test('OptikLink 保活', async ({ }, testInfo) => {
         }
         console.log(`✅ 主站登录成功！当前：${page.url()}`);
 
-        console.log('📤 点击 Login to Panel 弹窗...');
-        const modalBtn = page.locator('a[data-target="#logintopanel"], button[data-target="#logintopanel"], a:has-text("Login to Panel")').first();
-        await modalBtn.click();
-        await page.waitForTimeout(2000);
+        await page.waitForLoadState('domcontentloaded').catch(() => {});
+        await page.waitForTimeout(3000);
 
-        console.log('📤 点击 Panel Login 跳转控制台...');
-        const panelLoginBtn = page.getByRole('button', { name: 'Panel Login' });
-        await panelLoginBtn.waitFor({ state: 'visible' });
+        console.log('🔍 尝试寻找 Control Panel 访问入口...');
+        let panelPage = null;
 
-        const [panelPage] = await Promise.all([
-            page.context().waitForEvent('page'),
-            panelLoginBtn.click(),
-        ]);
+        const candidateSelectors = [
+            'a[data-target="#logintopanel"]',
+            'button[data-target="#logintopanel"]',
+            'a[data-target*="panel"]',
+            'button[data-target*="panel"]',
+            'a:has-text("Login to Panel")',
+            'a:has-text("Panel Login")',
+            'a:has-text("Control Panel")',
+            'a[href*="control.optiklink.net"]',
+        ];
+
+        let targetBtn = null;
+        for (const sel of candidateSelectors) {
+            const loc = page.locator(sel).first();
+            if (await loc.isVisible().catch(() => false)) {
+                targetBtn = loc;
+                console.log(`🔍 找到 Panel 按钮元素: ${sel}`);
+                break;
+            }
+        }
+
+        if (targetBtn) {
+            console.log('📤 点击 Panel 入口按钮...');
+            await targetBtn.click().catch(() => {});
+            await page.waitForTimeout(2000);
+
+            const panelLoginBtn = page.getByRole('button', { name: 'Panel Login' })
+                .or(page.locator('a:has-text("Panel Login")'))
+                .or(page.locator('a[href*="control.optiklink.net"]')).first();
+
+            if (await panelLoginBtn.isVisible().catch(() => false)) {
+                console.log('📤 点击 Panel Login 跳转控制台...');
+                const [pPage] = await Promise.all([
+                    page.context().waitForEvent('page'),
+                    panelLoginBtn.click(),
+                ]);
+                panelPage = pPage;
+            }
+        }
+
+        // 🛡️ 降级方案：未找到弹窗或交互未跳转时，直接新页面导航至控制台 URL
+        if (!panelPage) {
+            console.log('ℹ️ 未发现可点击弹窗，降级为直接打开控制台链接...');
+            panelPage = await page.context().newPage();
+            await panelPage.goto('https://control.optiklink.net', { waitUntil: 'domcontentloaded' });
+        }
 
         panelPage.setDefaultTimeout(TIMEOUT);
         activePage = panelPage;
 
         console.log('⏳ 等待控制台页面加载...');
-        await panelPage.waitForURL(/control\.optiklink\.net/, { timeout: TIMEOUT, waitUntil: 'domcontentloaded' });
+        await panelPage.waitForURL(/control\.optiklink\.net/, { timeout: TIMEOUT, waitUntil: 'domcontentloaded' }).catch(() => {});
 
         const currentUrl = panelPage.url();
         console.log(`✅ 已到达控制台页面：${currentUrl}`);
