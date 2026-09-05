@@ -129,16 +129,34 @@ test('OptikLink 保活', async ({ }, testInfo) => {
         console.log(`🛡️ 使用代理: ${proxyUrl.replace(/:\/\/.*@/, '://***@')}`);
     }
 
-    console.log('🔧 启动浏览器...');
+    console.log('🔧 启动防检测浏览器...');
     const browser = await chromium.launch({
         headless: true,
+        args: [
+            '--disable-blink-features=AutomationControlled',
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+        ],
         proxy: proxyConfig,
     });
-    const page = await browser.newPage();
+
+    const context = await browser.newContext({
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+        viewport: { width: 1280, height: 720 },
+        locale: 'en-US',
+    });
+
+    const page = await context.newPage();
     page.setDefaultTimeout(TIMEOUT);
     let activePage = page;
 
+    // 抹除自动化特征
     await page.addInitScript(() => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        window.chrome = { runtime: {} };
+        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+
         if (!location.hostname.includes('optiklink.net') && !location.hostname.includes('optiklink.com')) return;
 
         const AD_DOMAINS = [
@@ -198,26 +216,9 @@ test('OptikLink 保活', async ({ }, testInfo) => {
             if (url.startsWith('/') || url.includes('optiklink.net') || url.includes('optiklink.com')) return _open(url, ...args);
             return null;
         };
-
-        const _addEL = EventTarget.prototype.addEventListener;
-        EventTarget.prototype.addEventListener = function (type, fn, opts) {
-            if (type === 'click' && (this === window || this === document)) {
-                const src = fn?.toString() || '';
-                if (/setTimeout\s*\(\s*\w\s*,\s*0\s*\)/.test(src)) return;
-                if (/contextmenu.*localStorage|localStorage.*contextmenu/s.test(src)) return;
-            }
-            return _addEL.call(this, type, fn, opts);
-        };
-
-        Object.defineProperty(window, 'adsbygoogle', {
-            get: () => ({ loaded: true, push: () => {} }),
-            set: () => {},
-            configurable: false,
-        });
     });
 
     console.log('🚀 浏览器就绪！');
-    console.log('🛡️ OptikLink 广告猎手启动');
 
     try {
         console.log('🌐 验证出口 IP...');
@@ -243,7 +244,7 @@ test('OptikLink 保活', async ({ }, testInfo) => {
         const landedUrl = page.url();
 
         if (landedUrl.includes('discord.com/login')) {
-            console.log('✏️ 填写账号密码...');
+            console.log('✏️ 填写 Discord 账号密码...');
             await page.fill('input[name="email"]', email);
             await page.fill('input[name="password"]', password);
             console.log('📤 提交登录请求...');
@@ -261,7 +262,7 @@ test('OptikLink 保活', async ({ }, testInfo) => {
                 const btn = await page.waitForSelector('button.primary_a22cb0', { timeout: 5000 });
                 const btnText = (await btn.innerText()).trim();
                 if (/log\s*in/i.test(btnText) || btnText.includes('登录')) {
-                    console.log('✏️ 填写账号密码...');
+                    console.log('✏️ 填写 Discord 账号密码...');
                     await btn.click();
                     await page.waitForURL(/discord\.com\/login/, { timeout: 10000 });
                     await page.fill('input[name="email"]', email);
@@ -350,8 +351,6 @@ test('OptikLink 保活', async ({ }, testInfo) => {
                 await inputLoc.fill(String(result));
                 console.log('✏️ 已成功填入验证结果');
             }
-        } else {
-            console.log('ℹ️ 未在当前页面检测到明确的数学算式，尝试直接寻找提交按钮');
         }
 
         console.log('📤 3. 点击 CONTINUE WITH LOGIN...');
@@ -363,111 +362,151 @@ test('OptikLink 保活', async ({ }, testInfo) => {
         if (await continueBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
             await continueBtn.click();
             console.log('✨ 已点击 CONTINUE WITH LOGIN');
-        } else {
-            console.log('⚠️ 未定位到 CONTINUE WITH LOGIN 按钮，尝试寻找通用提交按钮');
-            const genericBtn = page.locator('button[type="submit"]').first();
-            if (await genericBtn.isVisible()) await genericBtn.click();
         }
 
-        console.log('⏳ 4. 等待页面跳转...');
+        console.log('⏳ 4. 等待页面跳转至 Dashboard...');
         await page.waitForTimeout(3000);
         try {
             await page.waitForURL(url => !url.toString().includes('/login'), { timeout: 20000 });
         } catch { /* 继续 */ }
-        console.log(`✅ 当前页面 URL: ${page.url()}`);
 
-        // ==================== 点击 Panel Login 走 SSO 自动登录 ====================
-        console.log('📤 5. 点击 Login to Panel 弹窗...');
+        // ==================== 从主站弹窗获取 Panel 账密 ====================
+        console.log('📤 5. 打开 Login to Panel 弹窗...');
         const panelModalTrigger = page.locator('a[data-target="#logintopanel"], button[data-target="#logintopanel"], a:has-text("Login to Panel")').first();
         await panelModalTrigger.waitFor({ state: 'visible', timeout: 10000 });
         await panelModalTrigger.click();
         await page.waitForTimeout(1500);
 
-        console.log('📤 6. 点击 Panel Login 按钮发起 SSO 登录...');
+        console.log('🔍 提取 Panel 用户名与密码...');
+        // 点击 [Click here to view] 展开真实密码
+        const viewPasswordBtn = page.locator('text="[Click here to view]"').first();
+        if (await viewPasswordBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+            await viewPasswordBtn.click();
+            await page.waitForTimeout(1000);
+        }
+
+        const credentials = await page.evaluate(() => {
+            const text = document.body.innerText;
+            const uMatch = text.match(/Your Panel Username:\s*([a-zA-Z0-9_]+)/i);
+            const pMatch = text.match(/Your Panel Password:\s*([^\s\n\r]+)/i);
+            return {
+                username: uMatch ? uMatch[1].trim() : null,
+                password: pMatch ? pMatch[1].trim() : null
+            };
+        });
+
+        const panelUser = process.env.PANEL_USER || credentials.username;
+        const panelPass = process.env.PANEL_PASSWORD || credentials.password;
+
+        if (!panelUser || !panelPass) {
+            throw new Error(`❌ 未能成功提取控制台账密，提结果: username=${panelUser}, password=${panelPass ? '***' : 'null'}`);
+        }
+        console.log(`🔑 成功获取控制台账号: ${panelUser}`);
+
+        console.log('📤 6. 点击 Panel Login 跳转控制台...');
         const panelLoginBtn = page.getByRole('button', { name: 'Panel Login' })
             .or(page.locator('a:has-text("Panel Login")'))
             .or(page.locator('button:has-text("Panel Login")'))
             .first();
 
-        await panelLoginBtn.waitFor({ state: 'visible' });
-
         const [panelPage] = await Promise.all([
-            page.context().waitForEvent('page').catch(() => page),
+            context.waitForEvent('page').catch(() => page),
             panelLoginBtn.click(),
         ]);
 
         panelPage.setDefaultTimeout(TIMEOUT);
         activePage = panelPage;
 
-        console.log('⏳ 7. 等待 SSO 自动完成重定向与鉴权...');
-        
-        // 循环等待控制台自动鉴权，不再填账号密码
-        let ssoLoggedIn = false;
-        for (let i = 0; i < 25; i++) {
-            await panelPage.waitForTimeout(1000);
-            const currentUrl = panelPage.url();
-            if (currentUrl.includes('control.optiklink.net') && !currentUrl.includes('/auth/login')) {
-                ssoLoggedIn = true;
-                break;
-            }
+        console.log('⏳ 7. 进入控制台页面，准备登录...');
+        await panelPage.waitForLoadState('domcontentloaded');
+        await panelPage.waitForTimeout(3000);
+
+        // 如果已经在面板 Dashboard（说明 Cookie 有效无需登录）
+        if (panelPage.url().includes('control.optiklink.net') && !panelPage.url().includes('/auth/login')) {
+            console.log('🎉 控制台已自动进入 Dashboard，无需输入账密！');
+        } else {
+            console.log('✏️ 拟人化填入控制台账密（绕过人机检测）...');
+            const userInput = panelPage.locator('input[name="username"], input[type="text"]').first();
+            const passInput = panelPage.locator('input[name="password"], input[type="password"]').first();
+
+            await userInput.waitFor({ state: 'visible', timeout: 15000 });
+
+            // 点击并慢速输入用户名
+            await userInput.click();
+            await panelPage.waitForTimeout(400);
+            await userInput.type(panelUser, { delay: 70 });
+
+            // 点击慢速输入密码
+            await panelPage.waitForTimeout(300);
+            await passInput.click();
+            await panelPage.waitForTimeout(400);
+            await passInput.type(panelPass, { delay: 80 });
+
+            // 模拟人类滑动鼠标提升 reCAPTCHA 评分
+            await panelPage.mouse.move(250, 350);
+            await panelPage.waitForTimeout(800);
+            await panelPage.mouse.move(400, 500);
+            await panelPage.waitForTimeout(800);
+
+            console.log('📤 提交控制台登录...');
+            const submitBtn = panelPage.locator('button[type="submit"], button:has-text("LOGIN"), button:has-text("Login")').first();
+            await submitBtn.click();
+
+            console.log('⏳ 等待控制台登录验证...');
+            await panelPage.waitForURL(url => !url.toString().includes('/auth/login'), { timeout: 25000 });
         }
 
-        if (!ssoLoggedIn) {
-            throw new Error(`❌ SSO 授权跳转超时，控制台仍停留在登录页：${panelPage.url()}`);
-        }
+        console.log(`✅ 控制台登录成功！当前页面：${panelPage.url()}`);
 
-        console.log(`✅ SSO 授权成功！当前已到达控制台：${panelPage.url()}`);
-
-        await panelPage.waitForTimeout(2000);
-
+        // ==================== 服务器状态检查与启动 ====================
         console.log('🔍 查找服务器...');
-        await panelPage.waitForTimeout(2000);
+        await panelPage.waitForTimeout(3000);
 
         const serverInfo = await panelPage.evaluate(() => {
             const card = document.querySelector('a[href*="/server/"]');
             if (!card) return null;
             const href = card.getAttribute('href');
             const id = href.replace('/server/', '').trim();
-            const nameEl = card.querySelector('p.sc-1ibsw91-5');
-            const name = nameEl ? nameEl.innerText.trim() : '';
+            const nameEl = card.querySelector('p.sc-1ibsw91-5') || card.querySelector('p');
+            const name = nameEl ? nameEl.innerText.trim() : 'My Server';
             return { id, name };
         });
 
-        if (!serverInfo) throw new Error('❌ 未找到服务器卡片');
+        if (!serverInfo) throw new Error('❌ 未能在控制台找到服务器列表');
         console.log(`✅ 找到服务器：${serverInfo.name} (${serverInfo.id})`);
 
         await panelPage.goto(`https://control.optiklink.net/server/${serverInfo.id}`, { waitUntil: 'domcontentloaded' });
-        console.log(`✅ 已到达服务器页面：${panelPage.url()}`);
+        console.log(`✅ 已进入服务器详情页：${panelPage.url()}`);
 
         const serverPage = panelPage;
 
-        console.log('🔍 检查服务器状态...');
+        console.log('🔍 检查服务器运行状态...');
         await serverPage.waitForTimeout(3000);
 
         let statusText = '';
         for (let i = 0; i < 12; i++) {
-            statusText = await serverPage.locator('p.sc-168cvuh-1').innerText().catch(() => '');
+            statusText = await serverPage.locator('p.sc-168cvuh-1, div[class*="status"]').first().innerText().catch(() => '');
             const s = statusText.toLowerCase();
             if (s.includes('running') || s.includes('offline') || s.includes('stopped')) break;
-            console.log(`  🔄 等待状态稳定（${statusText.trim()}）...`);
+            console.log(`  🔄 等待状态加载（${statusText.trim()}）...`);
             await serverPage.waitForTimeout(5000);
         }
 
-        console.log(`💻 服务器状态：${statusText.trim()}`);
+        console.log(`💻 当前状态：${statusText.trim()}`);
 
         if (statusText.toLowerCase().includes('running')) {
             console.log('🎉 保活成功！');
             await sendTG('✅ 保活成功！\n💻 服务器状态：🚀 Running', serverInfo.name);
         } else if (statusText.toLowerCase().includes('offline') || statusText.toLowerCase().includes('stopped')) {
-            console.log('⚠️ 服务器离线，尝试启动...');
+            console.log('⚠️ 服务器处于停止状态，尝试启动...');
             await serverPage.click('button:has-text("Start")');
-            console.log('📤 已点击 Start，持续监控状态...');
+            console.log('📤 已点击 Start，开始监控...');
 
             let started = false;
             for (let i = 0; i < 24; i++) {
                 await serverPage.waitForTimeout(5000);
-                const s = await serverPage.locator('p.sc-168cvuh-1').innerText().catch(() => '');
-                console.log(`  🔄 第 ${i + 1} 次检查，状态：${s.trim()}`);
+                const s = await serverPage.locator('p.sc-168cvuh-1, div[class*="status"]').first().innerText().catch(() => '');
+                console.log(`  🔄 状态监控 (${i + 1}/24)：${s.trim()}`);
                 if (s.toLowerCase().includes('running')) {
                     started = true;
                     break;
@@ -475,14 +514,14 @@ test('OptikLink 保活', async ({ }, testInfo) => {
             }
 
             if (started) {
-                console.log('✅ 服务器已成功启动！');
-                await sendTG('🔄 Start 启动！\n💻 服务器状态：🚀 Running', serverInfo.name);
+                console.log('✅ 服务器启动成功！');
+                await sendTG('🔄 已尝试 Start！\n💻 服务器状态：🚀 Running', serverInfo.name);
             } else {
-                console.log('❌ 等待超时，服务器未能启动');
-                await sendTG('❌ Start 启动失败，等待超时\n💻 服务器状态：💤 Offline', serverInfo.name);
+                console.log('❌ 启动超时');
+                await sendTG('❌ Start 点击成功但启动超时\n💻 服务器状态：💤 Offline', serverInfo.name);
             }
         } else {
-            console.log(`⚠️ 未知状态：${statusText.trim()}`);
+            console.log(`⚠️ 状态未明：${statusText.trim()}`);
             await sendTG(`⚠️ 状态未知\n💻 服务器状态：❓ ${statusText.trim()}`, serverInfo.name);
         }
 
@@ -492,7 +531,7 @@ test('OptikLink 保活', async ({ }, testInfo) => {
             await activePage.screenshot({ path: screenshotPath, fullPage: true });
             await testInfo.attach('failure', { path: screenshotPath, contentType: 'image/png' });
             console.log('📸 失败截图已保存');
-        } catch { /* 截图失败不影响主流程 */ }
+        } catch { /* 忽略截图错误 */ }
         await sendTG(`❌ 脚本异常：${e.message}`);
         throw e;
 
