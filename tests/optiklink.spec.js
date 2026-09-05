@@ -133,7 +133,7 @@ async function solveRecaptchaAudio(page) {
         console.log('🔍 正在检测 reCAPTCHA 验证码...');
         const recaptchaFrame = page.frames().find(f => f.url().includes('api2/anchor') || f.url().includes('enterprise/anchor'));
         if (!recaptchaFrame) {
-            console.log('ℹ️ 未检测到 reCAPTCHA 框架');
+            console.log('ℹ️ 未检测到可见的 reCAPTCHA 框架');
             return;
         }
 
@@ -246,7 +246,6 @@ test('OptikLink 保活', async ({ }, testInfo) => {
         proxy: proxyConfig,
     });
     
-    // 采用标准 Context 初始化，彻底消灭 newContext 相关报错
     const context = await browser.newContext();
     const page = await context.newPage();
     page.setDefaultTimeout(TIMEOUT);
@@ -390,9 +389,7 @@ test('OptikLink 保活', async ({ }, testInfo) => {
         await page.waitForLoadState('domcontentloaded').catch(() => {});
         await page.waitForTimeout(3000);
 
-        // ========================== 核心逻辑精简 ==========================
-        // 既然主站已经完成鉴权，直接在同一个 Tab 内跳入控制台，抛弃多窗口与弹窗检测
-        console.log('ℹ️ 统一切换至控制台页面 (直接导航，避免弹窗/新标签页报错)...');
+        console.log('ℹ️ 统一切换至控制台页面 (直接导航)...');
         await page.goto('https://control.optiklink.net', { waitUntil: 'domcontentloaded' });
 
         console.log('⏳ 等待控制台页面加载...');
@@ -405,15 +402,41 @@ test('OptikLink 保活', async ({ }, testInfo) => {
             console.log('✏️ 填写控制台账号密码...');
             await page.fill('input[name="username"]', panelUser);
             await page.fill('input[name="password"]', panelPass);
+            
+            console.log('⏳ 强制等待 3 秒，防止组件加载过慢...');
+            await page.waitForTimeout(3000);
 
-            // 控制台 reCAPTCHA 语音处理
+            // 控制台 reCAPTCHA 语音处理 (如果有可见质询)
             await solveRecaptchaAudio(page);
 
-            console.log('📤 提交控制台登录...');
-            await page.click('button[type="submit"]');
+            // 加入错误检测与重试机制，防止遇到 "This recaptcha instance did not render yet."
+            let loginSuccess = false;
+            for (let i = 0; i < 3; i++) {
+                console.log(`📤 提交控制台登录 (尝试 ${i + 1}/3)...`);
+                await page.click('button[type="submit"]');
 
-            console.log('⏳ 确认到达控制台首页...');
-            await page.waitForURL(url => !url.toString().includes('/auth/login'), { timeout: TIMEOUT, waitUntil: 'domcontentloaded' });
+                try {
+                    // 等待 URL 变化脱离 login 页面
+                    await page.waitForURL(url => !url.toString().includes('/auth/login'), { timeout: 6000 });
+                    loginSuccess = true;
+                    break;
+                } catch {
+                    // 如果超时没跳转，检查页面是不是飘红报未渲染的错了
+                    const errorVisible = await page.getByText('recaptcha instance did not render yet', { exact: false }).isVisible().catch(() => false);
+                    if (errorVisible) {
+                        console.log('⚠️ 被拦截：reCAPTCHA 尚未在底层渲染完成，等待 5 秒后重试...');
+                        await page.waitForTimeout(5000);
+                    } else {
+                        // 如果不是这个特定报错，跳出循环交给后续逻辑判断
+                        break;
+                    }
+                }
+            }
+
+            if (!loginSuccess) {
+                 console.log('⏳ 做最后一次跳转确认...');
+                 await page.waitForURL(url => !url.toString().includes('/auth/login'), { timeout: 15000, waitUntil: 'domcontentloaded' });
+            }
             console.log(`✅ 控制台登录成功！当前：${page.url()}`);
         } else {
             console.log('ℹ️ 检测到已不在登录页，直接进入首页...');
