@@ -1,213 +1,539 @@
+// tests/optiklink.spec.js
 const { test, chromium } = require('@playwright/test');
 const https = require('https');
 
-const DISCORD_ACCOUNT = process.env.DISCORD_ACCOUNT || ',';
-const [email, password] = DISCORD_ACCOUNT.split(',');
-
+const [email, password] = (process.env.DISCORD_ACCOUNT || ',').split(',');
 const [panelUser, panelPass] = (process.env.PANEL_ACCOUNT || ',').split(',');
-
 const [TG_CHAT_ID, TG_TOKEN] = (process.env.TG_BOT || ',').split(',');
-const TIMEOUT = 40000;
 
-function sendTG(msg) {
+const TIMEOUT = 60000;
+
+function nowStr() {
+    return new Date().toLocaleString('zh-CN', {
+        timeZone: 'Asia/Shanghai',
+        hour12: false,
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', second: '2-digit',
+    }).replace(/\//g, '-');
+}
+
+function sendTG(result, serverName = 'OptikLink') {
     return new Promise((resolve) => {
-        if (!TG_CHAT_ID || !TG_TOKEN) return resolve();
-        const body = JSON.stringify({
-            chat_id: TG_CHAT_ID,
-            text: `🎮 OptikLink 保活通知\n🕐 ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}\n${msg}`
-        });
+        if (!TG_CHAT_ID || !TG_TOKEN) {
+            console.log('⚠️ TG_BOT 未配置，跳过推送');
+            return resolve();
+        }
+
+        const msg = [
+            `🎮 OptikLink 保活通知`,
+            `🕐 运行时间: ${nowStr()}`,
+            `🖥 服务器: ${serverName}`,
+            `📊 执行结果: ${result}`,
+        ].join('\n');
+
+        const body = JSON.stringify({ chat_id: TG_CHAT_ID, text: msg });
         const req = https.request({
             hostname: 'api.telegram.org',
             path: `/bot${TG_TOKEN}/sendMessage`,
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-        }, () => resolve());
-        req.on('error', () => resolve());
+        }, (res) => {
+            if (res.statusCode === 200) {
+                console.log('📨 TG 推送成功');
+            } else {
+                console.log(`⚠️ TG 推送失败：HTTP ${res.statusCode}`);
+            }
+            resolve();
+        });
+
+        req.on('error', (e) => {
+            console.log(`⚠️ TG 推送异常：${e.message}`);
+            resolve();
+        });
+
+        req.setTimeout(15000, () => {
+            console.log('⚠️ TG 推送超时');
+            req.destroy();
+            resolve();
+        });
+
         req.write(body);
         req.end();
     });
 }
 
-// 自动识别 reCAPTCHA 语音验证码
-async function solveRecaptchaAudio(page) {
+// 🧮 1. 主站数学验证码自动求解
+async function solveMathCaptcha(page) {
     try {
-        const frame = page.frames().find(f => f.url().includes('recaptcha/api2/bframe'));
-        if (!frame) return false;
+        const captchaLabel = page.locator('label:has-text("+"), label:has-text("-"), label:has-text("*"), .captcha-text, [id*="captcha"]');
+        if (await captchaLabel.count() > 0) {
+            const text = await captchaLabel.first().innerText();
+            const match = text.match(/(\d+)\s*([\+\-\*])\s*(\d+)/);
+            if (match) {
+                const n1 = parseInt(match[1]);
+                const op = match[2];
+                const n2 = parseInt(match[3]);
+                let ans = 0;
+                if (op === '+') ans = n1 + n2;
+                else if (op === '-') ans = n1 - n2;
+                else if (op === '*') ans = n1 * n2;
 
-        const audioBtn = frame.locator('#recaptcha-audio-button');
-        if (await audioBtn.isVisible({ timeout: 4000 }).catch(() => false)) {
-            console.log('🤖 触发 Google reCAPTCHA，尝试语音破解...');
-            await audioBtn.click();
-            await page.waitForTimeout(2000);
-
-            const audioSrc = await frame.locator('#audio-source').getAttribute('src').catch(() => null);
-            if (!audioSrc) return false;
-
-            const audioBuffer = await page.request.get(audioSrc).then(r => r.buffer());
-            const sttRes = await page.request.post('https://api.wit.ai/speech', {
-                headers: {
-                    'Authorization': 'Bearer 677G5T334P7UGLP25T3S7S4I232G7HGL',
-                    'Content-Type': 'audio/mpeg',
-                },
-                data: audioBuffer,
-            });
-
-            const json = await sttRes.json().catch(() => ({}));
-            const text = json.text || json._text;
-            if (text) {
-                console.log(`💡 语音识别成功: "${text.trim()}"`);
-                await frame.locator('#audio-response').fill(text.trim());
-                await frame.locator('#recaptcha-verify-button').click();
-                await page.waitForTimeout(2000);
-                return true;
+                console.log(`🧮 识别到数学算式: ${n1} ${op} ${n2} = ${ans}`);
+                const captchaInput = page.locator('input[name="captcha"], input[placeholder*="captcha"], #captcha');
+                if (await captchaInput.count() > 0) {
+                    await captchaInput.fill(ans.toString());
+                    console.log('✅ 数学验证码填写完成');
+                }
             }
         }
     } catch (e) {
-        console.log(`⚠️ 语音识别跳过: ${e.message}`);
+        console.log(`ℹ️ 数学验证码处理跳过: ${e.message}`);
     }
-    return false;
 }
 
-test('OptikLink 保活', async () => {
-    console.log('🔧 启动防检测浏览器...');
-    const proxyConfig = process.env.GOST_PROXY ? { server: process.env.GOST_PROXY } : undefined;
+// 🎙️ 音频转文字辅助函数 (Wit.ai / Free Speech API)
+function transcribeAudio(audioUrl) {
+    return new Promise((resolve) => {
+        https.get(audioUrl, (res) => {
+            const chunks = [];
+            res.on('data', chunk => chunks.push(chunk));
+            res.on('end', () => {
+                const audioBuffer = Buffer.concat(chunks);
+                const witKey = process.env.WIT_API_KEY || '564H4OQ3KJJ2M2L33KHK42J2L2K3J3K3';
 
+                const req = https.request('https://api.wit.ai/speech', {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${witKey}`,
+                        'Content-Type': 'audio/mpeg',
+                    }
+                }, (witRes) => {
+                    let body = '';
+                    witRes.on('data', d => body += d);
+                    witRes.on('end', () => {
+                        try {
+                            const match = body.match(/"text":\s*"([^"]+)"/);
+                            if (match && match[1]) return resolve(match[1].trim());
+                        } catch {}
+                        resolve(null);
+                    });
+                });
+
+                req.on('error', () => resolve(null));
+                req.write(audioBuffer);
+                req.end();
+            });
+        }).on('error', () => resolve(null));
+    });
+}
+
+// 🤖 2. reCAPTCHA 自动语音识别求解
+async function solveRecaptchaAudio(page) {
+    try {
+        console.log('🔍 正在检测 reCAPTCHA 验证码...');
+        const recaptchaFrame = page.frames().find(f => f.url().includes('api2/anchor') || f.url().includes('enterprise/anchor'));
+        if (!recaptchaFrame) {
+            console.log('ℹ️ 未检测到 reCAPTCHA 框架');
+            return;
+        }
+
+        const checkbox = recaptchaFrame.locator('#recaptcha-anchor');
+        if (await checkbox.isVisible()) {
+            console.log('🤖 点击 reCAPTCHA 人机身份验证复选框...');
+            await checkbox.click();
+            await page.waitForTimeout(2500);
+        }
+
+        const isChecked = await recaptchaFrame.locator('.recaptcha-checkbox-checked').count() > 0;
+        if (isChecked) {
+            console.log('✅ reCAPTCHA 自动通过（无图片/语音质询）');
+            return;
+        }
+
+        // 寻找弹出的 Challenge 框架
+        const challengeFrame = page.frames().find(f => f.url().includes('api2/bframe') || f.url().includes('enterprise/bframe'));
+        if (!challengeFrame) return;
+
+        const audioBtn = challengeFrame.locator('#recaptcha-audio-button');
+        if (await audioBtn.isVisible()) {
+            console.log('🎙️ 点击语音验证码模式...');
+            await audioBtn.click();
+            await page.waitForTimeout(2500);
+        }
+
+        const errNotice = await challengeFrame.locator('.rc-doodle-error, .rc-audiochallenge-error-message').innerText().catch(() => '');
+        if (errNotice.includes('automated queries') || errNotice.includes('自动查询')) {
+            console.log('⚠️ reCAPTCHA 触发 IP 频控或机器人防御机制');
+            return;
+        }
+
+        const audioLink = await challengeFrame.locator('#audio-source, .rc-audiochallenge-tdownload-link').getAttribute('src').catch(() => null)
+            || await challengeFrame.locator('.rc-audiochallenge-tdownload-link').getAttribute('href').catch(() => null);
+
+        if (audioLink) {
+            console.log('📥 正在下载语音验证码并进行 STT 识别...');
+            const transcript = await transcribeAudio(audioLink);
+            if (transcript) {
+                console.log(`🗣️ 语音转文字成功: "${transcript}"`);
+                await challengeFrame.locator('#audio-response').fill(transcript);
+                await challengeFrame.locator('#recaptcha-verify-button').click();
+                await page.waitForTimeout(2500);
+                console.log('✅ reCAPTCHA 语音验证码已成功提交！');
+            } else {
+                console.log('⚠️ 语音识别未返回有效内容');
+            }
+        }
+    } catch (e) {
+        console.log(`ℹ️ reCAPTCHA 处理抛出异常: ${e.message}`);
+    }
+}
+
+// 处理 Discord 登录页
+async function handleDiscordLogin(page, email, password) {
+    await page.fill('input[name="email"]', email);
+    await page.fill('input[name="password"]', password);
+    await page.click('button[type="submit"]');
+    try {
+        await page.waitForURL(url => !url.toString().includes('discord.com/login'), { timeout: 15000 });
+    } catch {
+        let err = '账密错误或触发了 2FA / 验证码';
+        try { err = await page.locator('[class*="errorMessage"]').first().innerText(); } catch {}
+        throw new Error(`❌ Discord 登录失败: ${err}`);
+    }
+}
+
+// 处理 Discord OAuth 授权页
+async function handleOAuthPage(page) {
+    await page.waitForTimeout(2000);
+
+    for (let i = 0; i < 5; i++) {
+        if (!page.url().includes('discord.com')) return;
+
+        try {
+            const btn = await page.waitForSelector('button.primary_a22cb0', { timeout: 3000 });
+            const text = (await btn.innerText()).trim();
+
+            if (/scroll/i.test(text) || text.includes('滚动')) {
+                await page.evaluate(() => {
+                    const s = document.querySelector('[class*="scroller"]')
+                        || document.querySelector('[class*="scrollerBase"]')
+                        || document.querySelector('[class*="content"]');
+                    if (s) s.scrollTop = s.scrollHeight;
+                    window.scrollTo(0, document.body.scrollHeight);
+                });
+                await page.waitForTimeout(1500);
+                await btn.click();
+                await page.waitForTimeout(1500);
+            } else if (/authorize/i.test(text) || text.includes('授权')) {
+                await btn.click();
+                await page.waitForTimeout(3000);
+                return;
+            } else {
+                await page.waitForTimeout(1500);
+            }
+        } catch {
+            try {
+                await page.waitForURL(url => !url.toString().includes('discord.com'), { timeout: 10000 });
+            } catch { /* 继续等待 */ }
+            return;
+        }
+    }
+}
+
+test('OptikLink 保活', async ({ }, testInfo) => {
+    const proxyUrl = '';
+
+    if (!email || !password) {
+        throw new Error('❌ 缺少账号配置，格式: DISCORD_ACCOUNT=email,password');
+    }
+
+    let proxyConfig = undefined;
+    if (process.env.GOST_PROXY) {
+        try {
+            const http = require('http');
+            await new Promise((resolve, reject) => {
+                const req = http.request(
+                    { host: '127.0.0.1', port: 8080, path: '/', method: 'GET', timeout: 3000 },
+                    () => resolve()
+                );
+                req.on('error', reject);
+                req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+                req.end();
+            });
+            proxyConfig = { server: process.env.GOST_PROXY };
+            console.log('🛡️ 本地代理连通，使用 GOST 转发');
+        } catch {
+            console.log('⚠️ 本地代理不可达，降级为直连');
+        }
+    } else if (proxyUrl) {
+        proxyConfig = { server: proxyUrl };
+        console.log(`🛡️ 使用代理: ${proxyUrl.replace(/:\/\/.*@/, '://***@')}`);
+    }
+
+    console.log('🔧 启动浏览器...');
     const browser = await chromium.launch({
         headless: true,
-        args: ['--disable-blink-features=AutomationControlled', '--no-sandbox'],
         proxy: proxyConfig,
     });
-
-    const context = await browser.newContext({
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-        viewport: { width: 1280, height: 720 },
-    });
-
-    const page = await context.newPage();
+    const page = await browser.newPage();
     page.setDefaultTimeout(TIMEOUT);
+    let activePage = page;
 
+    // 屏蔽绝大多数弹窗和广告脚本
     await page.addInitScript(() => {
-        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        if (!location.hostname.includes('optiklink.net') && !location.hostname.includes('optiklink.com')) return;
+
+        const AD_DOMAINS = [
+            'tzegilo.com', 'alwingulla.com', 'auqot.com', 'jmosl.com', '094kk.com',
+            'tmll7.com', 'oundhertobeconsist.org',
+            'pagead2.googlesyndication.com', 'googlesyndication.com',
+            'googletagservices.com', 'doubleclick.net',
+            'adsbygoogle', 'popads', 'popcash', 'clickadu', 'tsyndicate',
+            'trafficjunky', 'afu.php',
+        ];
+        const isAd = (url) => url && AD_DOMAINS.some(d => url.includes(d));
+
+        const _createElement = document.createElement.bind(document);
+        document.createElement = function (tag) {
+            const el = _createElement(tag);
+            if (tag.toLowerCase() === 'script') {
+                const _desc = Object.getOwnPropertyDescriptor(HTMLScriptElement.prototype, 'src');
+                Object.defineProperty(el, 'src', {
+                    set(val) { if (!isAd(val)) _desc.set.call(this, val); },
+                    get() { return _desc.get.call(this); },
+                });
+            }
+            return el;
+        };
+
+        const _write = document.write.bind(document);
+        document.write = function (html) { if (!isAd(html)) return _write(html); };
+
+        const _appendChild = Element.prototype.appendChild;
+        Element.prototype.appendChild = function (node) {
+            if (node?.tagName === 'SCRIPT' && isAd(node.src)) return node;
+            return _appendChild.call(this, node);
+        };
+
+        const _insertBefore = Element.prototype.insertBefore;
+        Element.prototype.insertBefore = function (node, ref) {
+            if (node?.tagName === 'SCRIPT' && isAd(node.src)) return node;
+            return _insertBefore.call(this, node, ref);
+        };
+
+        const _fetch = window.fetch;
+        window.fetch = function (url, ...args) {
+            if (isAd(typeof url === 'string' ? url : url?.url))
+                return Promise.reject(new Error('blocked'));
+            return _fetch.call(this, url, ...args);
+        };
+
+        const _xhrOpen = XMLHttpRequest.prototype.open;
+        XMLHttpRequest.prototype.open = function (method, url, ...args) {
+            if (isAd(url)) return;
+            return _xhrOpen.call(this, method, url, ...args);
+        };
+
+        const _open = window.open.bind(window);
+        window.open = function (url, ...args) {
+            if (!url) return null;
+            if (url.startsWith('/') || url.includes('optiklink.net') || url.includes('optiklink.com')) return _open(url, ...args);
+            return null;
+        };
+
+        Object.defineProperty(window, 'adsbygoogle', {
+            get: () => ({ loaded: true, push: () => {} }),
+            set: () => {},
+            configurable: false,
+        });
     });
 
     console.log('🚀 浏览器就绪！');
+    console.log('🛡️ OptikLink 广告拦截增强版启动');
 
-    // ==================== 0. 验证出口 IP ====================
     try {
         console.log('🌐 验证出口 IP...');
-        await page.goto('https://api.ipify.org', { waitUntil: 'domcontentloaded', timeout: 15000 });
-        const exitIp = (await page.innerText('body')).trim();
-        console.log(`✅ 出口 IP 确认：${exitIp}`);
-    } catch (e) {
-        console.log(`⚠️ 出口 IP 检测跳过: ${e.message}`);
-    }
+        try {
+            const res = await page.goto('https://api.ipify.org?format=json', { waitUntil: 'domcontentloaded' });
+            const body = await res.text();
+            const ip = JSON.parse(body).ip || body;
+            const masked = ip.replace(/(\d+\.\d+\.\d+\.)\d+/, '$1xx');
+            console.log(`✅ 出口 IP 确认：${masked}`);
+        } catch {
+            console.log('⚠️ IP 验证超时，跳过');
+        }
 
-    let mainSiteOk = false;
-    let panelOk = false;
+        console.log('🔑 打开 OptikLink 登录页...');
+        await page.goto('https://optiklink.com/auth', { waitUntil: 'domcontentloaded' });
 
-    // ==================== 任务 1：OptikLink 主站保活 ====================
-    try {
-        console.log('🌐 [1/2] 开始主站登录...');
-        await page.goto('https://optiklink.net/login', { waitUntil: 'domcontentloaded' });
-        await page.waitForTimeout(2000);
+        // 尝试求解主站数学验证码（若存在）
+        await solveMathCaptcha(page);
 
-        // 如果跳转到了 Discord 授权
-        if (page.url().includes('discord.com')) {
-            console.log('🔑 填入 Discord 账号密码...');
+        console.log('📤 点击 Login with Discord...');
+        await page.click("a[href='login']");
+
+        console.log('⏳ 等待跳转 Discord 登录页...');
+        await page.waitForURL(url => !url.toString().includes('optiklink.com/auth'), { timeout: TIMEOUT });
+
+        const landedUrl = page.url();
+
+        if (landedUrl.includes('discord.com/login')) {
+            console.log('✏️ 填写 Discord 账号密码...');
             await page.fill('input[name="email"]', email);
             await page.fill('input[name="password"]', password);
+            console.log('📤 提交登录请求...');
             await page.click('button[type="submit"]');
-            await page.waitForTimeout(4000);
-        }
-
-        // 处理数学验证
-        if (page.url().includes('optiklink.net/login')) {
-            const mathExpr = await page.evaluate(() => {
-                const match = document.body.innerText.match(/(\d+)\s*([\+\-\*])\s*(\d+)/);
-                return match ? { n1: parseInt(match[1]), op: match[2], n2: parseInt(match[3]) } : null;
-            });
-
-            if (mathExpr) {
-                const res = mathExpr.op === '+' ? mathExpr.n1 + mathExpr.n2 : mathExpr.n1 - mathExpr.n2;
-                console.log(`🧮 计算数学题: ${mathExpr.n1} ${mathExpr.op} ${mathExpr.n2} = ${res}`);
-                const inputLoc = page.locator('input[type="number"], input[type="text"]').first();
-                if (await inputLoc.isVisible()) await inputLoc.fill(String(res));
-            }
-
-            const continueBtn = page.locator('button:has-text("CONTINUE WITH LOGIN"), a:has-text("CONTINUE WITH LOGIN")').first();
-            if (await continueBtn.isVisible().catch(() => false)) await continueBtn.click();
-            await page.waitForTimeout(3000);
-        }
-
-        mainSiteOk = !page.url().includes('/login');
-        console.log(mainSiteOk ? '✅ 主站保活成功！' : '⚠️ 主站登录未完全确认，继续执行控制台保活...');
-    } catch (e) {
-        console.log(`⚠️ 主站保活阶段异常 (非致命): ${e.message}`);
-    }
-
-    // ==================== 任务 2：Pterodactyl 控制台保活 ====================
-    try {
-        console.log('🌐 [2/2] 开始控制台 (Panel) 保活...');
-
-        // 伪装来自主站的请求 Header
-        await page.setExtraHTTPHeaders({
-            'referer': 'https://optiklink.net/'
-        });
-
-        // 针对网络阻断 (ERR_CONNECTION_CLOSED) 的重试逻辑
-        let panelLoaded = false;
-        for (let attempt = 1; attempt <= 3; attempt++) {
             try {
-                console.log(`🔄 尝试连接控制台登录页 (第 ${attempt} 次)...`);
-                await page.goto('https://panel.optiklink.net/auth/login', { 
-                    waitUntil: 'commit', 
-                    timeout: 25000 
-                });
-                panelLoaded = true;
-                break;
-            } catch (navErr) {
-                console.log(`⚠️ 第 ${attempt} 次连接失败 (${navErr.message})`);
-                if (attempt < 3) await page.waitForTimeout(3000);
+                await page.waitForURL(url => !url.toString().includes('discord.com/login'), { timeout: 15000 });
+            } catch {
+                let err = '账密错误或触发了 2FA / 验证码';
+                try { err = await page.locator('[class*="errorMessage"]').first().innerText(); } catch {}
+                await sendTG(`❌ Discord 登录失败：${err}`);
+                throw new Error(`❌ Discord 登录失败: ${err}`);
             }
         }
 
-        if (!panelLoaded) {
-            throw new Error('网络连接多次被服务器/Cloudflare拒绝 (ERR_CONNECTION_CLOSED)');
+        // 处理 Discord OAuth 授权页
+        console.log('⏳ 等待 OAuth 授权...');
+        try {
+            await page.waitForURL(/discord\.com\/oauth2\/authorize/, { timeout: 6000 });
+            console.log('🔍 进入 OAuth 授权页，自动点击授权中...');
+            await handleOAuthPage(page);
+            try {
+                await page.waitForURL(/optiklink\.net/, { timeout: 15000 });
+            } catch { /* 继续 */ }
+            console.log(`✅ 已离开 Discord，当前：${page.url()}`);
+        } catch (e) {
+            if (e.message.includes('Discord 登录失败')) throw e;
         }
 
+        console.log('⏳ 确认到达 OptikLink 主站...');
+        try {
+            await page.waitForURL(/optiklink\.net/, { timeout: 30000 });
+        } catch { /* 继续 */ }
+
+        if (!page.url().includes('optiklink.net')) {
+            throw new Error(`❌ 未到达 OptikLink，当前 URL: ${page.url()}`);
+        }
+        console.log(`✅ 主站登录成功！当前：${page.url()}`);
+
+        console.log('📤 点击 Login to Panel 弹窗...');
+        const modalBtn = page.locator('a[data-target="#logintopanel"], button[data-target="#logintopanel"], a:has-text("Login to Panel")').first();
+        await modalBtn.click();
         await page.waitForTimeout(2000);
 
-        if (!page.url().includes('/auth/login')) {
-            console.log('🎉 控制台已处于登录状态！');
-            panelOk = true;
+        console.log('📤 点击 Panel Login 跳转控制台...');
+        const panelLoginBtn = page.getByRole('button', { name: 'Panel Login' });
+        await panelLoginBtn.waitFor({ state: 'visible' });
+
+        const [panelPage] = await Promise.all([
+            page.context().waitForEvent('page'),
+            panelLoginBtn.click(),
+        ]);
+
+        panelPage.setDefaultTimeout(TIMEOUT);
+        activePage = panelPage;
+
+        console.log('⏳ 等待控制台页面加载...');
+        await panelPage.waitForURL(/control\.optiklink\.net/, { timeout: TIMEOUT, waitUntil: 'domcontentloaded' });
+
+        const currentUrl = panelPage.url();
+        console.log(`✅ 已到达控制台页面：${currentUrl}`);
+
+        if (currentUrl.includes('/auth/login')) {
+            console.log('✏️ 填写控制台账号密码...');
+            await panelPage.fill('input[name="username"]', panelUser);
+            await panelPage.fill('input[name="password"]', panelPass);
+
+            // 🤖 自动处理控制台 reCAPTCHA 验证码
+            await solveRecaptchaAudio(panelPage);
+
+            console.log('📤 提交控制台登录...');
+            await panelPage.click('button[type="submit"]');
+
+            console.log('⏳ 确认到达控制台首页...');
+            await panelPage.waitForURL(url => !url.toString().includes('/auth/login'), { timeout: TIMEOUT, waitUntil: 'domcontentloaded' });
+            console.log(`✅ 控制台登录成功！当前：${panelPage.url()}`);
         } else {
-            console.log(`✏️ 填入控制台账号: ${panelUser}`);
-            await page.locator('input[name="username"]').fill(panelUser);
-            await page.locator('input[name="password"]').fill(panelPass);
-
-            console.log('📤 点击控制台登录...');
-            await page.locator('button[type="submit"]').click();
-            await page.waitForTimeout(3000);
-
-            // 破解 reCAPTCHA 拦截
-            await solveRecaptchaAudio(page);
-
-            // 最终确认
-            await page.waitForURL(url => !url.toString().includes('/auth/login'), { timeout: 25000 });
-            panelOk = true;
-            console.log('✅ 控制台登录成功！');
+            console.log('ℹ️ 检测到已不在登录页，自动跳转至首页...');
         }
+
+        await panelPage.waitForTimeout(2000);
+
+        console.log('🔍 查找服务器...');
+        const serverInfo = await panelPage.evaluate(() => {
+            const card = document.querySelector('a[href*="/server/"]');
+            if (!card) return null;
+            const href = card.getAttribute('href');
+            const id = href.replace('/server/', '').trim();
+            const nameEl = card.querySelector('p.sc-1ibsw91-5');
+            const name = nameEl ? nameEl.innerText.trim() : '';
+            return { id, name };
+        });
+
+        if (!serverInfo) throw new Error('❌ 未找到服务器卡片');
+        console.log(`✅ 找到服务器：${serverInfo.name} (${serverInfo.id})`);
+
+        await panelPage.goto(`https://control.optiklink.net/server/${serverInfo.id}`, { waitUntil: 'domcontentloaded' });
+        console.log(`✅ 已到达服务器页面：${panelPage.url()}`);
+
+        const serverPage = panelPage;
+        console.log('🔍 检查服务器状态...');
+        await serverPage.waitForTimeout(3000);
+
+        let statusText = '';
+        for (let i = 0; i < 12; i++) {
+            statusText = await serverPage.locator('p.sc-168cvuh-1').innerText().catch(() => '');
+            const s = statusText.toLowerCase();
+            if (s.includes('running') || s.includes('offline') || s.includes('stopped')) break;
+            console.log(`  🔄 等待状态稳定（${statusText.trim()}）...`);
+            await serverPage.waitForTimeout(5000);
+        }
+
+        console.log(`💻 服务器状态：${statusText.trim()}`);
+
+        if (statusText.toLowerCase().includes('running')) {
+            console.log('🎉 保活成功！');
+            await sendTG('✅ 保活成功！\n💻 服务器状态：🚀 Running', serverInfo.name);
+        } else if (statusText.toLowerCase().includes('offline') || statusText.toLowerCase().includes('stopped')) {
+            console.log('⚠️ 服务器离线，尝试启动...');
+            await serverPage.click('button:has-text("Start")');
+            console.log('📤 已点击 Start，持续监控状态...');
+
+            let started = false;
+            for (let i = 0; i < 24; i++) {
+                await serverPage.waitForTimeout(5000);
+                const s = await serverPage.locator('p.sc-168cvuh-1').innerText().catch(() => '');
+                console.log(`  🔄 第 ${i + 1} 次检查，状态：${s.trim()}`);
+                if (s.toLowerCase().includes('running')) {
+                    started = true;
+                    break;
+                }
+            }
+
+            if (started) {
+                console.log('✅ 服务器已成功启动！');
+                await sendTG('🔄 Start 启动！\n💻 服务器状态：🚀 Running', serverInfo.name);
+            } else {
+                console.log('❌ 等待超时，服务器未能启动');
+                await sendTG('❌ Start 启动失败，等待超时\n💻 服务器状态：💤 Offline', serverInfo.name);
+            }
+        } else {
+            console.log(`⚠️ 未知状态：${statusText.trim()}`);
+            await sendTG(`⚠️ 状态未知\n💻 服务器状态：❓ ${statusText.trim()}`, serverInfo.name);
+        }
+
     } catch (e) {
-        console.log(`❌ 控制台登录失败: ${e.message}`);
+        try {
+            const screenshotPath = testInfo.outputPath('failure.png');
+            await activePage.screenshot({ path: screenshotPath, fullPage: true });
+            await testInfo.attach('failure', { path: screenshotPath, contentType: 'image/png' });
+            console.log('📸 失败截图已保存');
+        } catch { /* 忽略 */ }
+        await sendTG(`❌ 脚本异常：${e.message}`);
+        throw e;
+
     } finally {
         await browser.close();
-    }
-
-    // 总结与通知
-    if (panelOk) {
-        await sendTG(`✅ 保活成功！(主站: ${mainSiteOk ? '成功' : '跳过'}, Panel: 成功)`);
-    } else {
-        await sendTG(`❌ 保活失败！Panel 登录未通过。`);
-        throw new Error('Panel 登录失败');
     }
 });
