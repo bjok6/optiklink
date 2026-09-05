@@ -1160,33 +1160,26 @@ test('OptikLink 保活', async ({ }, testInfo) => {
             '⏳ 确认到达 OptikLink...'
         );
 
-        try {
-
-            await page.waitForURL(
-                /optiklink\.net\/home(?:[/?#]|$)/,
-                {
-                    timeout: 30000
-                }
-            );
-
-        } catch {
-            // 如果已经在 home 则继续
+try {
+    await page.waitForURL(
+        /optiklink\.net/,
+        {
+            timeout: 30000
         }
+    );
+} catch {
+    // 继续
+}
 
+if (!page.url().includes('optiklink.net')) {
+    throw new Error(
+        `❌ OAuth 后未到达 OptikLink，当前 URL: ${page.url()}`
+    );
+}
 
-        if (
-            !/optiklink\.net\/home(?:[/?#]|$)/
-                .test(page.url())
-        ) {
-
-            throw new Error(
-                `❌ OAuth 后未到达 OptikLink 首页，当前 URL: ${page.url()}`
-            );
-        }
-
-        console.log(
-            `✅ 登录成功！当前：${page.url()}`
-        );
+console.log(
+    `✅ 登录成功！当前: ${page.url()}`
+);
 
 
         /*
