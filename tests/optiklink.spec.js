@@ -4,7 +4,6 @@ const https = require('https');
 const DISCORD_ACCOUNT = process.env.DISCORD_ACCOUNT || ',';
 const [email, password] = DISCORD_ACCOUNT.split(',');
 
-// 恢复你最初的 PANEL_ACCOUNT 变量解析
 const [panelUser, panelPass] = (process.env.PANEL_ACCOUNT || ',').split(',');
 
 const [TG_CHAT_ID, TG_TOKEN] = (process.env.TG_BOT || ',').split(',');
@@ -149,7 +148,33 @@ test('OptikLink 保活', async () => {
     // ==================== 任务 2：Pterodactyl 控制台保活 ====================
     try {
         console.log('🌐 [2/2] 开始控制台 (Panel) 保活...');
-        await page.goto('https://panel.optiklink.net/auth/login', { waitUntil: 'domcontentloaded' });
+
+        // 伪装来自主站的请求 Header
+        await page.setExtraHTTPHeaders({
+            'referer': 'https://optiklink.net/'
+        });
+
+        // 针对网络阻断 (ERR_CONNECTION_CLOSED) 的重试逻辑
+        let panelLoaded = false;
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            try {
+                console.log(`🔄 尝试连接控制台登录页 (第 ${attempt} 次)...`);
+                await page.goto('https://panel.optiklink.net/auth/login', { 
+                    waitUntil: 'commit', 
+                    timeout: 25000 
+                });
+                panelLoaded = true;
+                break;
+            } catch (navErr) {
+                console.log(`⚠️ 第 ${attempt} 次连接失败 (${navErr.message})`);
+                if (attempt < 3) await page.waitForTimeout(3000);
+            }
+        }
+
+        if (!panelLoaded) {
+            throw new Error('网络连接多次被服务器/Cloudflare拒绝 (ERR_CONNECTION_CLOSED)');
+        }
+
         await page.waitForTimeout(2000);
 
         if (!page.url().includes('/auth/login')) {
