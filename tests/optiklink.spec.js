@@ -91,40 +91,38 @@ async function solveMathCaptcha(page) {
     }
 }
 
-// 🎙️ 音频转文字辅助函数
-function transcribeAudio(audioUrl) {
-    return new Promise((resolve) => {
-        https.get(audioUrl, (res) => {
-            const chunks = [];
-            res.on('data', chunk => chunks.push(chunk));
-            res.on('end', () => {
-                const audioBuffer = Buffer.concat(chunks);
-                const witKey = process.env.WIT_API_KEY || '564H4OQ3KJJ2M2L33KHK42J2L2K3J3K3';
+// 🎙️ 音频转文字辅助函数（走浏览器代理下载 + 15s 超时，避免卡死）
+async function transcribeAudio(page, audioUrl) {
+    try {
+        const resp = await page.request.get(audioUrl, { timeout: 15000 });
+        if (!resp.ok()) return null;
+        const audioBuffer = await resp.body();
+        const witKey = process.env.WIT_API_KEY || '564H4OQ3KJJ2M2L33KHK42J2L2K3J3K3';
 
-                const req = https.request('https://api.wit.ai/speech', {
-                    method: 'POST',
-                    headers: {
-                        'Authorization': `Bearer ${witKey}`,
-                        'Content-Type': 'audio/mpeg',
-                    }
-                }, (witRes) => {
-                    let body = '';
-                    witRes.on('data', d => body += d);
-                    witRes.on('end', () => {
-                        try {
-                            const match = body.match(/"text":\s*"([^"]+)"/);
-                            if (match && match[1]) return resolve(match[1].trim());
-                        } catch {}
-                        resolve(null);
-                    });
-                });
-
-                req.on('error', () => resolve(null));
-                req.write(audioBuffer);
-                req.end();
+        const body = await new Promise((resolve) => {
+            const req = https.request('https://api.wit.ai/speech', {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${witKey}`,
+                    'Content-Type': 'audio/mpeg',
+                },
+                timeout: 15000,
+            }, (witRes) => {
+                let data = '';
+                witRes.on('data', d => data += d);
+                witRes.on('end', () => resolve(data));
             });
-        }).on('error', () => resolve(null));
-    });
+            req.on('error', () => resolve(null));
+            req.on('timeout', () => { req.destroy(); resolve(null); });
+            req.write(audioBuffer);
+            req.end();
+        });
+
+        const match = body && body.match(/"text":\s*"([^"]+)"/);
+        return match ? match[1].trim() : null;
+    } catch {
+        return null;
+    }
 }
 
 // 🤖 2. reCAPTCHA 自动语音识别求解
@@ -154,34 +152,54 @@ async function solveRecaptchaAudio(page) {
         if (!challengeFrame) return;
 
         const audioBtn = challengeFrame.locator('#recaptcha-audio-button');
-        if (await audioBtn.isVisible()) {
+        if (await audioBtn.isVisible().catch(() => false)) {
             console.log('🎙️ 点击语音验证码模式...');
-            // 加上 force: true 穿透背景遮罩层的拦截
+            // force: true 穿透背景遮罩层的拦截
             await audioBtn.click({ force: true });
-            await page.waitForTimeout(2500);
+        } else {
+            console.log('ℹ️ 未找到语音模式入口，跳过 reCAPTCHA 处理');
+            return;
         }
 
-        const errNotice = await challengeFrame.locator('.rc-doodle-error, .rc-audiochallenge-error-message').innerText().catch(() => '');
+        // 等待语音面板真正出现（最多 8 秒），不要用默认 60 秒超时
+        const audioSource = challengeFrame.locator('#audio-source').first();
+        try {
+            await audioSource.waitFor({ state: 'attached', timeout: 8000 });
+        } catch {
+            console.log('⚠️ 语音质询未能加载，跳过 reCAPTCHA 处理');
+            return;
+        }
+
+        // 错误提示用 1.5 秒短探测；正常打开语音质询时不会出现该元素
+        const errNotice = await challengeFrame
+            .locator('.rc-doodle-error, .rc-audiochallenge-error-message')
+            .first().innerText({ timeout: 1500 }).catch(() => '');
         if (errNotice.includes('automated queries') || errNotice.includes('自动查询')) {
             console.log('⚠️ reCAPTCHA 触发 IP 频控或机器人防御机制');
             return;
         }
 
-        const audioLink = await challengeFrame.locator('#audio-source, .rc-audiochallenge-tdownload-link').getAttribute('src').catch(() => null)
-            || await challengeFrame.locator('.rc-audiochallenge-tdownload-link').getAttribute('href').catch(() => null);
+        // 音频地址先取 src，失败再退回取 href，各 3 秒
+        let audioLink = await audioSource.getAttribute('src', { timeout: 3000 }).catch(() => null);
+        if (!audioLink) {
+            audioLink = await challengeFrame.locator('.rc-audiochallenge-tdownload-link')
+                .first().getAttribute('href', { timeout: 3000 }).catch(() => null);
+        }
+        if (!audioLink) {
+            console.log('⚠️ 未取到语音下载地址，跳过 reCAPTCHA 处理');
+            return;
+        }
 
-        if (audioLink) {
-            console.log('📥 正在下载语音验证码并进行 STT 识别...');
-            const transcript = await transcribeAudio(audioLink);
-            if (transcript) {
-                console.log(`🗣️ 语音转文字成功: "${transcript}"`);
-                await challengeFrame.locator('#audio-response').fill(transcript);
-                await challengeFrame.locator('#recaptcha-verify-button').click({ force: true });
-                await page.waitForTimeout(2500);
-                console.log('✅ reCAPTCHA 语音验证码已成功提交！');
-            } else {
-                console.log('⚠️ 语音识别未返回有效内容');
-            }
+        console.log('📥 正在下载语音验证码并进行 STT 识别...');
+        const transcript = await transcribeAudio(page, audioLink);
+        if (transcript) {
+            console.log(`🗣️ 语音转文字成功: "${transcript}"`);
+            await challengeFrame.locator('#audio-response').fill(transcript);
+            await challengeFrame.locator('#recaptcha-verify-button').click({ force: true });
+            await page.waitForTimeout(2500);
+            console.log('✅ reCAPTCHA 语音验证码已成功提交！');
+        } else {
+            console.log('⚠️ 语音识别未返回有效内容');
         }
     } catch (e) {
         console.log(`ℹ️ reCAPTCHA 处理抛出异常: ${e.message}`);
