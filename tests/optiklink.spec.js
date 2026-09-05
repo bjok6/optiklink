@@ -245,9 +245,11 @@ test('OptikLink 保活', async ({ }, testInfo) => {
         headless: true,
         proxy: proxyConfig,
     });
-    const page = await browser.newPage();
+    
+    // 采用标准 Context 初始化，彻底消灭 newContext 相关报错
+    const context = await browser.newContext();
+    const page = await context.newPage();
     page.setDefaultTimeout(TIMEOUT);
-    let activePage = page;
 
     // 拦截弹窗与广告
     await page.addInitScript(() => {
@@ -388,87 +390,39 @@ test('OptikLink 保活', async ({ }, testInfo) => {
         await page.waitForLoadState('domcontentloaded').catch(() => {});
         await page.waitForTimeout(3000);
 
-        console.log('🔍 尝试寻找 Control Panel 访问入口...');
-        let panelPage = null;
-
-        const candidateSelectors = [
-            'a[data-target="#logintopanel"]',
-            'button[data-target="#logintopanel"]',
-            'a[data-target*="panel"]',
-            'button[data-target*="panel"]',
-            'a:has-text("Login to Panel")',
-            'a:has-text("Panel Login")',
-            'a:has-text("Control Panel")',
-            'a[href*="control.optiklink.net"]',
-        ];
-
-        let targetBtn = null;
-        for (const sel of candidateSelectors) {
-            const loc = page.locator(sel).first();
-            if (await loc.isVisible().catch(() => false)) {
-                targetBtn = loc;
-                console.log(`🔍 找到 Panel 按钮元素: ${sel}`);
-                break;
-            }
-        }
-
-        if (targetBtn) {
-            console.log('📤 点击 Panel 入口按钮...');
-            await targetBtn.click().catch(() => {});
-            await page.waitForTimeout(2000);
-
-            const panelLoginBtn = page.getByRole('button', { name: 'Panel Login' })
-                .or(page.locator('a:has-text("Panel Login")'))
-                .or(page.locator('a[href*="control.optiklink.net"]')).first();
-
-            if (await panelLoginBtn.isVisible().catch(() => false)) {
-                console.log('📤 点击 Panel Login 跳转控制台...');
-                const [pPage] = await Promise.all([
-                    page.context().waitForEvent('page'),
-                    panelLoginBtn.click(),
-                ]);
-                panelPage = pPage;
-            }
-        }
-
-        // 🛡️ 降级方案：未找到弹窗或交互未跳转时，直接新页面导航至控制台 URL
-        if (!panelPage) {
-            console.log('ℹ️ 未发现可点击弹窗，降级为直接打开控制台链接...');
-            panelPage = await page.context().newPage();
-            await panelPage.goto('https://control.optiklink.net', { waitUntil: 'domcontentloaded' });
-        }
-
-        panelPage.setDefaultTimeout(TIMEOUT);
-        activePage = panelPage;
+        // ========================== 核心逻辑精简 ==========================
+        // 既然主站已经完成鉴权，直接在同一个 Tab 内跳入控制台，抛弃多窗口与弹窗检测
+        console.log('ℹ️ 统一切换至控制台页面 (直接导航，避免弹窗/新标签页报错)...');
+        await page.goto('https://control.optiklink.net', { waitUntil: 'domcontentloaded' });
 
         console.log('⏳ 等待控制台页面加载...');
-        await panelPage.waitForURL(/control\.optiklink\.net/, { timeout: TIMEOUT, waitUntil: 'domcontentloaded' }).catch(() => {});
+        await page.waitForURL(/control\.optiklink\.net/, { timeout: TIMEOUT, waitUntil: 'domcontentloaded' }).catch(() => {});
 
-        const currentUrl = panelPage.url();
+        const currentUrl = page.url();
         console.log(`✅ 已到达控制台页面：${currentUrl}`);
 
         if (currentUrl.includes('/auth/login')) {
             console.log('✏️ 填写控制台账号密码...');
-            await panelPage.fill('input[name="username"]', panelUser);
-            await panelPage.fill('input[name="password"]', panelPass);
+            await page.fill('input[name="username"]', panelUser);
+            await page.fill('input[name="password"]', panelPass);
 
             // 控制台 reCAPTCHA 语音处理
-            await solveRecaptchaAudio(panelPage);
+            await solveRecaptchaAudio(page);
 
             console.log('📤 提交控制台登录...');
-            await panelPage.click('button[type="submit"]');
+            await page.click('button[type="submit"]');
 
             console.log('⏳ 确认到达控制台首页...');
-            await panelPage.waitForURL(url => !url.toString().includes('/auth/login'), { timeout: TIMEOUT, waitUntil: 'domcontentloaded' });
-            console.log(`✅ 控制台登录成功！当前：${panelPage.url()}`);
+            await page.waitForURL(url => !url.toString().includes('/auth/login'), { timeout: TIMEOUT, waitUntil: 'domcontentloaded' });
+            console.log(`✅ 控制台登录成功！当前：${page.url()}`);
         } else {
-            console.log('ℹ️ 检测到已不在登录页，自动跳转至首页...');
+            console.log('ℹ️ 检测到已不在登录页，直接进入首页...');
         }
 
-        await panelPage.waitForTimeout(2000);
+        await page.waitForTimeout(2000);
 
         console.log('🔍 查找服务器...');
-        const serverInfo = await panelPage.evaluate(() => {
+        const serverInfo = await page.evaluate(() => {
             const card = document.querySelector('a[href*="/server/"]');
             if (!card) return null;
             const href = card.getAttribute('href');
@@ -481,20 +435,19 @@ test('OptikLink 保活', async ({ }, testInfo) => {
         if (!serverInfo) throw new Error('❌ 未找到服务器卡片');
         console.log(`✅ 找到服务器：${serverInfo.name} (${serverInfo.id})`);
 
-        await panelPage.goto(`https://control.optiklink.net/server/${serverInfo.id}`, { waitUntil: 'domcontentloaded' });
-        console.log(`✅ 已到达服务器页面：${panelPage.url()}`);
+        await page.goto(`https://control.optiklink.net/server/${serverInfo.id}`, { waitUntil: 'domcontentloaded' });
+        console.log(`✅ 已到达服务器页面：${page.url()}`);
 
-        const serverPage = panelPage;
         console.log('🔍 检查服务器状态...');
-        await serverPage.waitForTimeout(3000);
+        await page.waitForTimeout(3000);
 
         let statusText = '';
         for (let i = 0; i < 12; i++) {
-            statusText = await serverPage.locator('p.sc-168cvuh-1').innerText().catch(() => '');
+            statusText = await page.locator('p.sc-168cvuh-1').innerText().catch(() => '');
             const s = statusText.toLowerCase();
             if (s.includes('running') || s.includes('offline') || s.includes('stopped')) break;
             console.log(`  🔄 等待状态稳定（${statusText.trim()}）...`);
-            await serverPage.waitForTimeout(5000);
+            await page.waitForTimeout(5000);
         }
 
         console.log(`💻 服务器状态：${statusText.trim()}`);
@@ -504,13 +457,13 @@ test('OptikLink 保活', async ({ }, testInfo) => {
             await sendTG('✅ 保活成功！\n💻 服务器状态：🚀 Running', serverInfo.name);
         } else if (statusText.toLowerCase().includes('offline') || statusText.toLowerCase().includes('stopped')) {
             console.log('⚠️ 服务器离线，尝试启动...');
-            await serverPage.click('button:has-text("Start")');
+            await page.click('button:has-text("Start")');
             console.log('📤 已点击 Start，持续监控状态...');
 
             let started = false;
             for (let i = 0; i < 24; i++) {
-                await serverPage.waitForTimeout(5000);
-                const s = await serverPage.locator('p.sc-168cvuh-1').innerText().catch(() => '');
+                await page.waitForTimeout(5000);
+                const s = await page.locator('p.sc-168cvuh-1').innerText().catch(() => '');
                 console.log(`  🔄 第 ${i + 1} 次检查，状态：${s.trim()}`);
                 if (s.toLowerCase().includes('running')) {
                     started = true;
@@ -533,7 +486,7 @@ test('OptikLink 保活', async ({ }, testInfo) => {
     } catch (e) {
         try {
             const screenshotPath = testInfo.outputPath('failure.png');
-            await activePage.screenshot({ path: screenshotPath, fullPage: true });
+            await page.screenshot({ path: screenshotPath, fullPage: true });
             await testInfo.attach('failure', { path: screenshotPath, contentType: 'image/png' });
             console.log('📸 失败截图已保存');
         } catch { /* 忽略 */ }
