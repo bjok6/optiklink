@@ -1,7 +1,36 @@
 // tests/optiklink.spec.js
 const { test, chromium } = require('@playwright/test');
 const https = require('https');
+const fs = require('fs');
+const path = require('path');
 
+// 控制台登录会话文件：保存 control.optiklink.net 的 cookie，供后续运行复用、绕开 reCAPTCHA
+const STATE_FILE = process.env.SESSION_FILE || path.join(process.cwd(), 'control-session.json');
+
+function loadSavedState() {
+    try {
+        if (!fs.existsSync(STATE_FILE)) return null;
+        const state = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+        if (!state || !Array.isArray(state.cookies) || state.cookies.length === 0) return null;
+        return state;
+    } catch (e) {
+        console.log(`⚠️ 会话文件读取失败：${e.message}`);
+        return null;
+    }
+}
+
+
+async function saveState(context) {
+    try {
+        fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
+        fs.writeFileSync(STATE_FILE, JSON.stringify(await context.storageState(), null, 2));
+        console.log(`💾 控制台会话已保存：${STATE_FILE}`);
+        return true;
+    } catch (e) {
+        console.log(`⚠️ 会话保存失败：${e.message}`);
+        return false;
+    }
+}
 const [email, password] = (process.env.DISCORD_ACCOUNT || ',').split(',');
 const [panelUser, panelPass] = (process.env.PANEL_ACCOUNT || ',').split(',');
 const [TG_CHAT_ID, TG_TOKEN] = (process.env.TG_BOT || ',').split(',');
@@ -246,7 +275,7 @@ async function handleOAuthPageOnce(page) {
 test('OptikLink 保活', async ({ }, testInfo) => {
     const proxyUrl = 'socks5://127.0.0.1:1080';
 
-    if (!email || !password) {
+    if ((!email || !password) && !loadSavedState()) {
         throw new Error('❌ 缺少账号配置，格式: DISCORD_ACCOUNT=email,password');
     }
 
@@ -257,14 +286,50 @@ test('OptikLink 保活', async ({ }, testInfo) => {
     }
 
     console.log('🔧 启动浏览器...');
-    const browser = await chromium.launch({
+    // 优先用系统真实 Chrome（GH runner 自带），降低被 reCAPTCHA 识别为自动化浏览器的概率
+    const launchOptions = {
         headless: true,
         proxy: proxyConfig,
-    });
+        args: ['--disable-blink-features=AutomationControlled'],
+    };
+    let browser;
+    try {
+        browser = await chromium.launch({ ...launchOptions, channel: process.env.PW_CHANNEL || 'chrome' });
+    } catch (e) {
+        console.log(`ℹ️ 系统 Chrome 不可用（${String(e.message).split('\n')[0]}），回退内置 Chromium`);
+        browser = await chromium.launch(launchOptions);
+    }
     
-    const context = await browser.newContext();
+    // 先取真实 UA（去掉 HeadlessChrome 字样）
+    const probe = await browser.newPage();
+    const realUA = (await probe.evaluate(() => navigator.userAgent)).replace('HeadlessChrome', 'Chrome');
+    await probe.close();
+
+    const context = await browser.newContext({
+        proxy: proxyConfig,
+        storageState: loadSavedState() || undefined,
+        userAgent: realUA,
+        locale: 'zh-CN',
+        timezoneId: 'Asia/Shanghai',
+        viewport: { width: 1280, height: 720 },
+    });
     const page = await context.newPage();
     page.setDefaultTimeout(TIMEOUT);
+
+    // 抹掉自动化指纹，尽量模拟真实浏览器（降低 reCAPTCHA 弹验证码概率）
+    await page.addInitScript(() => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en-US', 'en'] });
+        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+        window.chrome = window.chrome || { runtime: {} };
+        const origQuery = navigator.permissions && navigator.permissions.query;
+        if (origQuery) {
+            navigator.permissions.query = (p) =>
+                p && p.name === 'notifications'
+                    ? Promise.resolve({ state: Notification.permission })
+                    : origQuery.call(navigator.permissions, p);
+        }
+    });
 
     // 拦截弹窗与广告
     await page.addInitScript(() => {
@@ -339,152 +404,173 @@ test('OptikLink 保活', async ({ }, testInfo) => {
     console.log('🛡️ OptikLink 广告拦截增强版启动');
 
     try {
-        console.log('🌐 验证出口 IP...');
-        try {
-            const res = await page.goto('https://api.ipify.org?format=json', { waitUntil: 'domcontentloaded' });
-            const body = await res.text();
-            const ip = JSON.parse(body).ip || body;
-            const masked = ip.replace(/(\d+\.\d+\.\d+\.)\d+/, '$1xx');
-            console.log(`✅ 出口 IP 确认：${masked}`);
-        } catch {
-            console.log('⚠️ IP 验证超时，跳过');
-        }
+        // 1) 会话快路径：先直接访问控制台；若已保存的登录会话仍有效，则跳过 Discord/面板登录与 reCAPTCHA
+        console.log('🔑 尝试直接进入控制台（复用已保存会话）...');
+        await page.goto('https://control.optiklink.net/', { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await page.waitForTimeout(2500);
+        const sessionOk = page.url().includes('control.optiklink.net') && !page.url().includes('/auth/login');
 
-        console.log('🔑 打开 OptikLink 登录页...');
-        await page.goto('https://optiklink.com/auth', { waitUntil: 'domcontentloaded' });
-
-        // 主站数学验证码
-        await solveMathCaptcha(page);
-
-        console.log('📤 点击 Login with Discord...');
-        await page.click("a[href='login']");
-
-        // 🔄 Discord 鉴权状态机循环
-        console.log('⏳ 正在处理 Discord 登录与 OAuth 授权...');
-        const authStartTime = Date.now();
-        while (Date.now() - authStartTime < 45000) {
-            const currentUrl = page.url();
-
-            if (currentUrl.includes('optiklink.net') || (currentUrl.includes('optiklink.com') && !currentUrl.includes('discord.com'))) {
-                break;
+        if (sessionOk) {
+            console.log(`✅ 会话有效，直接进入控制台：${page.url()}`);
+            if (page.url() !== 'https://control.optiklink.net/') {
+                await page.goto('https://control.optiklink.net/', { waitUntil: 'domcontentloaded' });
             }
-
-            if (currentUrl.includes('discord.com/login')) {
-                console.log('✏️ 处于 Discord 登录页，填写账号密码...');
-                await page.fill('input[name="email"]', email);
-                await page.fill('input[name="password"]', password);
-                console.log('📤 提交 Discord 登录请求...');
-                await page.click('button[type="submit"]');
-                try {
-                    await page.waitForURL(url => !url.toString().includes('discord.com/login'), { timeout: 15000 });
-                } catch {
-                    let err = '账密错误或触发了 2FA / 验证码';
-                    try { err = await page.locator('[class*="errorMessage"]').first().innerText(); } catch {}
-                    await sendTG(`❌ Discord 登录失败：${err}`);
-                    throw new Error(`❌ Discord 登录失败: ${err}`);
-                }
-            } else if (currentUrl.includes('discord.com/oauth2')) {
-                console.log('🔍 进入 OAuth 授权页，处理授权按钮...');
-                await handleOAuthPageOnce(page);
-                await page.waitForTimeout(2000);
-            } else {
-                await page.waitForTimeout(1500);
-            }
-        }
-
-        console.log('⏳ 确认到达 OptikLink 主站...');
-        try {
-            await page.waitForURL(/optiklink\.net/, { timeout: 20000 });
-        } catch { /* 继续 */ }
-
-        if (!page.url().includes('optiklink.net')) {
-            throw new Error(`❌ 未到达 OptikLink，当前 URL: ${page.url()}`);
-        }
-        console.log(`✅ 主站登录成功！当前：${page.url()}`);
-
-        await page.waitForLoadState('domcontentloaded').catch(() => {});
-        await page.waitForTimeout(3000);
-
-        console.log('✅ 主站登录成功！正在寻找控制面板入口...');
-        const panelLink = page.locator('a[href*="control.optiklink.net"], a:has-text("Panel"), a:has-text("控制台"), a:has-text("管理"), a:has-text("Dashboard")').first();
-
-        if (await panelLink.isVisible().catch(() => false)) {
-            console.log('✨ 发现面板直达链接，正在点击以继承会话...');
-            await Promise.all([
-                page.waitForURL(url => url.toString().includes('control.optiklink.net'), { timeout: 15000 }).catch(() => {}),
-                panelLink.click()
-            ]);
         } else {
-            console.log('ℹ️ 未发现直达链接，降级直接导航至控制台...');
-            await page.goto('https://control.optiklink.net/auth/login', { waitUntil: 'domcontentloaded' });
-        }
+            console.log('ℹ️ 无有效会话，开始完整登录流程...');
+            if (!panelUser || !panelPass) {
+                throw new Error('❌ 缺少控制台账号配置 PANEL_ACCOUNT=user,pass');
+            }
+            console.log('🌐 验证出口 IP...');
+            try {
+                const res = await page.goto('https://api.ipify.org?format=json', { waitUntil: 'domcontentloaded' });
+                const body = await res.text();
+                const ip = JSON.parse(body).ip || body;
+                const masked = ip.replace(/(\d+\.\d+\.\d+\.)\d+/, '$1xx');
+                console.log(`✅ 出口 IP 确认：${masked}`);
+            } catch {
+                console.log('⚠️ IP 验证超时，跳过');
+            }
 
-        console.log('⏳ 等待控制台页面加载...');
-        await page.waitForURL(/control\.optiklink\.net/, { timeout: TIMEOUT, waitUntil: 'domcontentloaded' }).catch(() => {});
+            console.log('🔑 打开 OptikLink 登录页...');
+            await page.goto('https://optiklink.com/auth', { waitUntil: 'domcontentloaded' });
 
-        const currentUrl = page.url();
-        console.log(`✅ 已到达控制台页面：${currentUrl}`);
+            // 主站数学验证码
+            await solveMathCaptcha(page);
 
-        if (currentUrl.includes('/auth/login')) {
-            console.log('✏️ 填写控制台账号密码...');
-            await page.fill('input[name="username"]', panelUser);
-            await page.fill('input[name="password"]', panelPass);
-            
-            console.log('⏳ 强制等待 3 秒，防止组件加载过慢...');
+            console.log('📤 点击 Login with Discord...');
+            await page.click("a[href='login']");
+
+            // 🔄 Discord 鉴权状态机循环
+            console.log('⏳ 正在处理 Discord 登录与 OAuth 授权...');
+            const authStartTime = Date.now();
+            while (Date.now() - authStartTime < 45000) {
+                const currentUrl = page.url();
+
+                if (currentUrl.includes('optiklink.net') || (currentUrl.includes('optiklink.com') && !currentUrl.includes('discord.com'))) {
+                    break;
+                }
+
+                if (currentUrl.includes('discord.com/login')) {
+                    console.log('✏️ 处于 Discord 登录页，填写账号密码...');
+                    await page.fill('input[name="email"]', email);
+                    await page.fill('input[name="password"]', password);
+                    console.log('📤 提交 Discord 登录请求...');
+                    await page.click('button[type="submit"]');
+                    try {
+                        await page.waitForURL(url => !url.toString().includes('discord.com/login'), { timeout: 15000 });
+                    } catch {
+                        let err = '账密错误或触发了 2FA / 验证码';
+                        try { err = await page.locator('[class*="errorMessage"]').first().innerText(); } catch {}
+                        await sendTG(`❌ Discord 登录失败：${err}`);
+                        throw new Error(`❌ Discord 登录失败: ${err}`);
+                    }
+                } else if (currentUrl.includes('discord.com/oauth2')) {
+                    console.log('🔍 进入 OAuth 授权页，处理授权按钮...');
+                    await handleOAuthPageOnce(page);
+                    await page.waitForTimeout(2000);
+                } else {
+                    await page.waitForTimeout(1500);
+                }
+            }
+
+            console.log('⏳ 确认到达 OptikLink 主站...');
+            try {
+                await page.waitForURL(/optiklink\.net/, { timeout: 20000 });
+            } catch { /* 继续 */ }
+
+            if (!page.url().includes('optiklink.net')) {
+                throw new Error(`❌ 未到达 OptikLink，当前 URL: ${page.url()}`);
+            }
+            console.log(`✅ 主站登录成功！当前：${page.url()}`);
+
+            await page.waitForLoadState('domcontentloaded').catch(() => {});
             await page.waitForTimeout(3000);
 
-            // 控制台 reCAPTCHA 语音处理 (如果有可见质询)
-            await solveRecaptchaAudio(page);
+            console.log('✅ 主站登录成功！正在寻找控制面板入口...');
+            const panelLink = page.locator('a[href*="control.optiklink.net"], a:has-text("Panel"), a:has-text("控制台"), a:has-text("管理"), a:has-text("Dashboard")').first();
 
-            // 重试机制：提交后若才弹出验证码质询则再解一次再重提，
-            // 同时避免 "This recaptcha instance did not render yet." 的拦截
-            let loginSuccess = false;
-            let triedSolveAgain = false;
-            for (let i = 0; i < 3; i++) {
-                console.log(`📤 提交控制台登录 (尝试 ${i + 1}/3)...`);
-                try {
-                    await page.click('button[type="submit"]', { timeout: 5000 });
-                } catch {
-                    console.log('⚠️ 提交按钮暂时不可点击（可能被验证码弹层遮挡），等待 2 秒重试');
-                    await page.waitForTimeout(2000);
-                    continue;
-                }
-
-                try {
-                    await page.waitForURL(url => !url.toString().includes('/auth/login'), { timeout: 6000 });
-                    loginSuccess = true;
-                    break;
-                } catch { /* 没跳转说明登录被拒，继续排查 */ }
-
-                // invisible 模式常见：提交后才弹出质询。出现质询则尝试自动解一次再重新提交
-                const hasChallenge = page.frames().some(f => /(api2|enterprise)\/bframe/.test(f.url()));
-                if (hasChallenge && !triedSolveAgain) {
-                    console.log('🔍 提交后检测到验证码质询，尝试自动求解...');
-                    await page.waitForTimeout(1500);
-                    await solveRecaptchaAudio(page);
-                    triedSolveAgain = true;
-                    continue;
-                }
-
-                const errorVisible = await page.getByText('recaptcha instance did not render yet', { exact: false }).isVisible().catch(() => false);
-                if (errorVisible) {
-                    console.log('⚠️ 被拦截：reCAPTCHA 尚未在底层渲染完成，等待 5 秒后重试...');
-                    await page.waitForTimeout(5000);
-                } else {
-                    break;
-                }
+            if (await panelLink.isVisible().catch(() => false)) {
+                console.log('✨ 发现面板直达链接，正在点击以继承会话...');
+                await Promise.all([
+                    page.waitForURL(url => url.toString().includes('control.optiklink.net'), { timeout: 15000 }).catch(() => {}),
+                    panelLink.click()
+                ]);
+            } else {
+                console.log('ℹ️ 未发现直达链接，降级直接导航至控制台...');
+                await page.goto('https://control.optiklink.net/auth/login', { waitUntil: 'domcontentloaded' });
             }
 
-            if (!loginSuccess) {
-                // 明确报错，而不是用 waitForURL 抛难懂的 TimeoutError
-                const bodyText = await page.locator('body').innerText({ timeout: 3000 }).catch(() => '');
-                const errLine = (bodyText.match(/[^\n]*(error|invalid|incorrect|错误|失败|验证|用户名|密码)[^\n]*/i) || [])[0];
-                const hint = errLine ? errLine.trim().slice(0, 200) : '页面无明确错误提示';
-                throw new Error(`❌ 控制台登录失败：仍停留在登录页（reCAPTCHA 未通过或账号密码有误）。提示：${hint}`);
+            console.log('⏳ 等待控制台页面加载...');
+            await page.waitForURL(/control\.optiklink\.net/, { timeout: TIMEOUT, waitUntil: 'domcontentloaded' }).catch(() => {});
+
+            const currentUrl = page.url();
+            console.log(`✅ 已到达控制台页面：${currentUrl}`);
+
+            if (currentUrl.includes('/auth/login')) {
+                console.log('✏️ 填写控制台账号密码...');
+                await page.fill('input[name="username"]', panelUser);
+                await page.fill('input[name="password"]', panelPass);
+
+                console.log('⏳ 强制等待 3 秒，防止组件加载过慢...');
+                await page.waitForTimeout(3000);
+
+                // 控制台 reCAPTCHA 语音处理 (如果有可见质询)
+                await solveRecaptchaAudio(page);
+
+                // 重试机制：提交后若才弹出验证码质询则再解一次再重提，
+                // 同时避免 "This recaptcha instance did not render yet." 的拦截
+                let loginSuccess = false;
+                let triedSolveAgain = false;
+                for (let i = 0; i < 3; i++) {
+                    console.log(`📤 提交控制台登录 (尝试 ${i + 1}/3)...`);
+                    try {
+                        await page.click('button[type="submit"]', { timeout: 5000 });
+                    } catch {
+                        console.log('⚠️ 提交按钮暂时不可点击（可能被验证码弹层遮挡），等待 2 秒重试');
+                        await page.waitForTimeout(2000);
+                        continue;
+                    }
+
+                    try {
+                        await page.waitForURL(url => !url.toString().includes('/auth/login'), { timeout: 6000 });
+                        loginSuccess = true;
+                        break;
+                    } catch { /* 没跳转说明登录被拒，继续排查 */ }
+
+                    // invisible 模式常见：提交后才弹出质询。出现质询则尝试自动解一次再重新提交
+                    const hasChallenge = page.frames().some(f => /(api2|enterprise)\/bframe/.test(f.url()));
+                    if (hasChallenge && !triedSolveAgain) {
+                        console.log('🔍 提交后检测到验证码质询，尝试自动求解...');
+                        await page.waitForTimeout(1500);
+                        await solveRecaptchaAudio(page);
+                        triedSolveAgain = true;
+                        continue;
+                    }
+
+                    const errorVisible = await page.getByText('recaptcha instance did not render yet', { exact: false }).isVisible().catch(() => false);
+                    if (errorVisible) {
+                        console.log('⚠️ 被拦截：reCAPTCHA 尚未在底层渲染完成，等待 5 秒后重试...');
+                        await page.waitForTimeout(5000);
+                    } else {
+                        break;
+                    }
+                }
+
+                if (!loginSuccess) {
+                    // 明确报错，而不是用 waitForURL 抛难懂的 TimeoutError
+                    const bodyText = await page.locator('body').innerText({ timeout: 3000 }).catch(() => '');
+                    const errLine = (bodyText.match(/[^\n]*(error|invalid|incorrect|错误|失败|验证|用户名|密码)[^\n]*/i) || [])[0];
+                    const hint = errLine ? errLine.trim().slice(0, 200) : '页面无明确错误提示';
+                    throw new Error(`❌ 控制台登录失败：仍停留在登录页（reCAPTCHA 未通过或账号密码有误）。提示：${hint}`);
+                }
+                console.log(`✅ 控制台登录成功！当前：${page.url()}`);
+            } else {
+                console.log('ℹ️ 检测到已不在登录页，直接进入首页...');
             }
-            console.log(`✅ 控制台登录成功！当前：${page.url()}`);
-        } else {
-            console.log('ℹ️ 检测到已不在登录页，直接进入首页...');
+            // 3) 登录成功/已在控制台 → 保存会话供下次复用，绕开 reCAPTCHA
+            if (!page.url().includes('/auth/login')) {
+                await saveState(context);
+            }
         }
 
         await page.waitForTimeout(2000);
