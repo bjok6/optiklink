@@ -140,7 +140,7 @@ async function solveRecaptchaAudio(page) {
         const checkbox = recaptchaFrame.locator('#recaptcha-anchor');
         if (await checkbox.isVisible()) {
             console.log('🤖 点击 reCAPTCHA 人机身份验证复选框...');
-            await checkbox.click();
+            await checkbox.click({ force: true });
             await page.waitForTimeout(2500);
         }
 
@@ -156,7 +156,8 @@ async function solveRecaptchaAudio(page) {
         const audioBtn = challengeFrame.locator('#recaptcha-audio-button');
         if (await audioBtn.isVisible()) {
             console.log('🎙️ 点击语音验证码模式...');
-            await audioBtn.click();
+            // 加上 force: true 穿透背景遮罩层的拦截
+            await audioBtn.click({ force: true });
             await page.waitForTimeout(2500);
         }
 
@@ -175,7 +176,7 @@ async function solveRecaptchaAudio(page) {
             if (transcript) {
                 console.log(`🗣️ 语音转文字成功: "${transcript}"`);
                 await challengeFrame.locator('#audio-response').fill(transcript);
-                await challengeFrame.locator('#recaptcha-verify-button').click();
+                await challengeFrame.locator('#recaptcha-verify-button').click({ force: true });
                 await page.waitForTimeout(2500);
                 console.log('✅ reCAPTCHA 语音验证码已成功提交！');
             } else {
@@ -211,33 +212,16 @@ async function handleOAuthPageOnce(page) {
 }
 
 test('OptikLink 保活', async ({ }, testInfo) => {
-    const proxyUrl = '';
+    const proxyUrl = 'socks5://127.0.0.1:1080';
 
     if (!email || !password) {
         throw new Error('❌ 缺少账号配置，格式: DISCORD_ACCOUNT=email,password');
     }
 
     let proxyConfig = undefined;
-    if (process.env.GOST_PROXY) {
-        try {
-            const http = require('http');
-            await new Promise((resolve, reject) => {
-                const req = http.request(
-                    { host: '127.0.0.1', port: 8080, path: '/', method: 'GET', timeout: 3000 },
-                    () => resolve()
-                );
-                req.on('error', reject);
-                req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
-                req.end();
-            });
-            proxyConfig = { server: process.env.GOST_PROXY };
-            console.log('🛡️ 本地代理连通，使用 GOST 转发');
-        } catch {
-            console.log('⚠️ 本地代理不可达，降级为直连');
-        }
-    } else if (proxyUrl) {
+    if (proxyUrl) {
         proxyConfig = { server: proxyUrl };
-        console.log(`🛡️ 使用代理: ${proxyUrl.replace(/:\/\/.*@/, '://***@')}`);
+        console.log(`🛡️ 使用代理: ${proxyUrl}`);
     }
 
     console.log('🔧 启动浏览器...');
@@ -389,8 +373,19 @@ test('OptikLink 保活', async ({ }, testInfo) => {
         await page.waitForLoadState('domcontentloaded').catch(() => {});
         await page.waitForTimeout(3000);
 
-        console.log('ℹ️ 统一切换至控制台页面 (直接导航)...');
-        await page.goto('https://control.optiklink.net', { waitUntil: 'domcontentloaded' });
+        console.log('✅ 主站登录成功！正在寻找控制面板入口...');
+        const panelLink = page.locator('a[href*="control.optiklink.net"], a:has-text("Panel"), a:has-text("控制台"), a:has-text("管理"), a:has-text("Dashboard")').first();
+
+        if (await panelLink.isVisible().catch(() => false)) {
+            console.log('✨ 发现面板直达链接，正在点击以继承会话...');
+            await Promise.all([
+                page.waitForURL(url => url.toString().includes('control.optiklink.net'), { timeout: 15000 }).catch(() => {}),
+                panelLink.click()
+            ]);
+        } else {
+            console.log('ℹ️ 未发现直达链接，降级直接导航至控制台...');
+            await page.goto('https://control.optiklink.net/auth/login', { waitUntil: 'domcontentloaded' });
+        }
 
         console.log('⏳ 等待控制台页面加载...');
         await page.waitForURL(/control\.optiklink\.net/, { timeout: TIMEOUT, waitUntil: 'domcontentloaded' }).catch(() => {});
@@ -427,7 +422,6 @@ test('OptikLink 保活', async ({ }, testInfo) => {
                         console.log('⚠️ 被拦截：reCAPTCHA 尚未在底层渲染完成，等待 5 秒后重试...');
                         await page.waitForTimeout(5000);
                     } else {
-                        // 如果不是这个特定报错，跳出循环交给后续逻辑判断
                         break;
                     }
                 }
