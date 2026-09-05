@@ -150,7 +150,6 @@ async function solveRecaptchaAudio(page) {
             return;
         }
 
-        // 寻找弹出的 Challenge 框架
         const challengeFrame = page.frames().find(f => f.url().includes('api2/bframe') || f.url().includes('enterprise/bframe'));
         if (!challengeFrame) return;
 
@@ -188,56 +187,27 @@ async function solveRecaptchaAudio(page) {
     }
 }
 
-// 处理 Discord 登录页
-async function handleDiscordLogin(page, email, password) {
-    await page.fill('input[name="email"]', email);
-    await page.fill('input[name="password"]', password);
-    await page.click('button[type="submit"]');
+// 单次处理 Discord OAuth 授权按钮
+async function handleOAuthPageOnce(page) {
     try {
-        await page.waitForURL(url => !url.toString().includes('discord.com/login'), { timeout: 15000 });
-    } catch {
-        let err = '账密错误或触发了 2FA / 验证码';
-        try { err = await page.locator('[class*="errorMessage"]').first().innerText(); } catch {}
-        throw new Error(`❌ Discord 登录失败: ${err}`);
-    }
-}
+        const btn = await page.waitForSelector('button.primary_a22cb0', { timeout: 4000 });
+        const text = (await btn.innerText()).trim();
 
-// 处理 Discord OAuth 授权页
-async function handleOAuthPage(page) {
-    await page.waitForTimeout(2000);
-
-    for (let i = 0; i < 5; i++) {
-        if (!page.url().includes('discord.com')) return;
-
-        try {
-            const btn = await page.waitForSelector('button.primary_a22cb0', { timeout: 3000 });
-            const text = (await btn.innerText()).trim();
-
-            if (/scroll/i.test(text) || text.includes('滚动')) {
-                await page.evaluate(() => {
-                    const s = document.querySelector('[class*="scroller"]')
-                        || document.querySelector('[class*="scrollerBase"]')
-                        || document.querySelector('[class*="content"]');
-                    if (s) s.scrollTop = s.scrollHeight;
-                    window.scrollTo(0, document.body.scrollHeight);
-                });
-                await page.waitForTimeout(1500);
-                await btn.click();
-                await page.waitForTimeout(1500);
-            } else if (/authorize/i.test(text) || text.includes('授权')) {
-                await btn.click();
-                await page.waitForTimeout(3000);
-                return;
-            } else {
-                await page.waitForTimeout(1500);
-            }
-        } catch {
-            try {
-                await page.waitForURL(url => !url.toString().includes('discord.com'), { timeout: 10000 });
-            } catch { /* 继续等待 */ }
-            return;
+        if (/scroll/i.test(text) || text.includes('滚动')) {
+            await page.evaluate(() => {
+                const s = document.querySelector('[class*="scroller"]')
+                    || document.querySelector('[class*="scrollerBase"]')
+                    || document.querySelector('[class*="content"]');
+                if (s) s.scrollTop = s.scrollHeight;
+                window.scrollTo(0, document.body.scrollHeight);
+            });
+            await page.waitForTimeout(1000);
+            await btn.click();
+        } else if (/authorize/i.test(text) || text.includes('授权')) {
+            await btn.click();
+            console.log('  ✨ 已点击授权按钮');
         }
-    }
+    } catch { /* 没找到按钮继续下一次循环 */ }
 }
 
 test('OptikLink 保活', async ({ }, testInfo) => {
@@ -279,7 +249,7 @@ test('OptikLink 保活', async ({ }, testInfo) => {
     page.setDefaultTimeout(TIMEOUT);
     let activePage = page;
 
-    // 屏蔽绝大多数弹窗和广告脚本
+    // 拦截弹窗与广告
     await page.addInitScript(() => {
         if (!location.hostname.includes('optiklink.net') && !location.hostname.includes('optiklink.com')) return;
 
@@ -366,50 +336,49 @@ test('OptikLink 保活', async ({ }, testInfo) => {
         console.log('🔑 打开 OptikLink 登录页...');
         await page.goto('https://optiklink.com/auth', { waitUntil: 'domcontentloaded' });
 
-        // 尝试求解主站数学验证码（若存在）
+        // 主站数学验证码
         await solveMathCaptcha(page);
 
         console.log('📤 点击 Login with Discord...');
         await page.click("a[href='login']");
 
-        console.log('⏳ 等待跳转 Discord 登录页...');
-        await page.waitForURL(url => !url.toString().includes('optiklink.com/auth'), { timeout: TIMEOUT });
+        // 🔄 Discord 鉴权状态机循环：支持各种跳转与二次重定向
+        console.log('⏳ 正在处理 Discord 登录与 OAuth 授权...');
+        const authStartTime = Date.now();
+        while (Date.now() - authStartTime < 45000) {
+            const currentUrl = page.url();
 
-        const landedUrl = page.url();
-
-        if (landedUrl.includes('discord.com/login')) {
-            console.log('✏️ 填写 Discord 账号密码...');
-            await page.fill('input[name="email"]', email);
-            await page.fill('input[name="password"]', password);
-            console.log('📤 提交登录请求...');
-            await page.click('button[type="submit"]');
-            try {
-                await page.waitForURL(url => !url.toString().includes('discord.com/login'), { timeout: 15000 });
-            } catch {
-                let err = '账密错误或触发了 2FA / 验证码';
-                try { err = await page.locator('[class*="errorMessage"]').first().innerText(); } catch {}
-                await sendTG(`❌ Discord 登录失败：${err}`);
-                throw new Error(`❌ Discord 登录失败: ${err}`);
+            // 如果已经跳回主站，直接退出循环
+            if (currentUrl.includes('optiklink.net') || (currentUrl.includes('optiklink.com') && !currentUrl.includes('discord.com'))) {
+                break;
             }
-        }
 
-        // 处理 Discord OAuth 授权页
-        console.log('⏳ 等待 OAuth 授权...');
-        try {
-            await page.waitForURL(/discord\.com\/oauth2\/authorize/, { timeout: 6000 });
-            console.log('🔍 进入 OAuth 授权页，自动点击授权中...');
-            await handleOAuthPage(page);
-            try {
-                await page.waitForURL(/optiklink\.net/, { timeout: 15000 });
-            } catch { /* 继续 */ }
-            console.log(`✅ 已离开 Discord，当前：${page.url()}`);
-        } catch (e) {
-            if (e.message.includes('Discord 登录失败')) throw e;
+            if (currentUrl.includes('discord.com/login')) {
+                console.log('✏️ 处于 Discord 登录页，填写账号密码...');
+                await page.fill('input[name="email"]', email);
+                await page.fill('input[name="password"]', password);
+                console.log('📤 提交 Discord 登录请求...');
+                await page.click('button[type="submit"]');
+                try {
+                    await page.waitForURL(url => !url.toString().includes('discord.com/login'), { timeout: 15000 });
+                } catch {
+                    let err = '账密错误或触发了 2FA / 验证码';
+                    try { err = await page.locator('[class*="errorMessage"]').first().innerText(); } catch {}
+                    await sendTG(`❌ Discord 登录失败：${err}`);
+                    throw new Error(`❌ Discord 登录失败: ${err}`);
+                }
+            } else if (currentUrl.includes('discord.com/oauth2')) {
+                console.log('🔍 进入 OAuth 授权页，处理授权按钮...');
+                await handleOAuthPageOnce(page);
+                await page.waitForTimeout(2000);
+            } else {
+                await page.waitForTimeout(1500);
+            }
         }
 
         console.log('⏳ 确认到达 OptikLink 主站...');
         try {
-            await page.waitForURL(/optiklink\.net/, { timeout: 30000 });
+            await page.waitForURL(/optiklink\.net/, { timeout: 20000 });
         } catch { /* 继续 */ }
 
         if (!page.url().includes('optiklink.net')) {
@@ -445,7 +414,7 @@ test('OptikLink 保活', async ({ }, testInfo) => {
             await panelPage.fill('input[name="username"]', panelUser);
             await panelPage.fill('input[name="password"]', panelPass);
 
-            // 🤖 自动处理控制台 reCAPTCHA 验证码
+            // 控制台 reCAPTCHA 语音处理
             await solveRecaptchaAudio(panelPage);
 
             console.log('📤 提交控制台登录...');
