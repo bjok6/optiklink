@@ -1,26 +1,19 @@
-// tests/optiklink.spec.js
 const { test, chromium } = require('@playwright/test');
 const https = require('https');
 
-const [email, password] = (process.env.DISCORD_ACCOUNT || ',').split(',');
+const DISCORD_ACCOUNT = process.env.DISCORD_ACCOUNT || ',';
+const [email, password] = DISCORD_ACCOUNT.split(',');
+
 const [TG_CHAT_ID, TG_TOKEN] = (process.env.TG_BOT || ',').split(',');
+const TIMEOUT = 40000;
 
-const TIMEOUT = 60000;
-
-function nowStr() {
-    return new Date().toLocaleString('zh-CN', {
-        timeZone: 'Asia/Shanghai',
-        hour12: false,
-        year: 'numeric', month: '2-digit', day: '2-digit',
-        hour: '2-digit', minute: '2-digit', second: '2-digit',
-    }).replace(/\//g, '-');
-}
-
-function sendTG(result, serverName = 'OptikLink') {
+function sendTG(msg) {
     return new Promise((resolve) => {
         if (!TG_CHAT_ID || !TG_TOKEN) return resolve();
-        const msg = `🎮 OptikLink 保活通知\n🕐 运行时间: ${nowStr()}\n🖥 服务器: ${serverName}\n📊 执行结果: ${result}`;
-        const body = JSON.stringify({ chat_id: TG_CHAT_ID, text: msg });
+        const body = JSON.stringify({
+            chat_id: TG_CHAT_ID,
+            text: `🎮 OptikLink 保活通知\n🕐 ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}\n${msg}`
+        });
         const req = https.request({
             hostname: 'api.telegram.org',
             path: `/bot${TG_TOKEN}/sendMessage`,
@@ -33,42 +26,34 @@ function sendTG(result, serverName = 'OptikLink') {
     });
 }
 
-// 自动识别并破解 reCAPTCHA 语音验证码
-async function solveAudioRecaptcha(page) {
+// 自动识别 reCAPTCHA 语音验证码
+async function solveRecaptchaAudio(page) {
     try {
         const frame = page.frames().find(f => f.url().includes('recaptcha/api2/bframe'));
         if (!frame) return false;
 
         const audioBtn = frame.locator('#recaptcha-audio-button');
-        if (await audioBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
-            console.log('🤖 检测到 reCAPTCHA 拦截，尝试通过语音验证破解...');
+        if (await audioBtn.isVisible({ timeout: 4000 }).catch(() => false)) {
+            console.log('🤖 触发 Google reCAPTCHA，尝试语音破解...');
             await audioBtn.click();
             await page.waitForTimeout(2000);
 
-            // 检查音频源
             const audioSrc = await frame.locator('#audio-source').getAttribute('src').catch(() => null);
-            if (!audioSrc) {
-                console.log('⚠️ 语音验证不可用（IP 频繁被限制）');
-                return false;
-            }
+            if (!audioSrc) return false;
 
-            // 下载 mp3 并调用语音转换
             const audioBuffer = await page.request.get(audioSrc).then(r => r.buffer());
-            
-            // 使用免费 Wit.ai 语音转文字 API 识别音频
             const sttRes = await page.request.post('https://api.wit.ai/speech', {
                 headers: {
-                    'Authorization': 'Bearer 677G5T334P7UGLP25T3S7S4I232G7HGL', // 免费通用 Speech Token
+                    'Authorization': 'Bearer 677G5T334P7UGLP25T3S7S4I232G7HGL',
                     'Content-Type': 'audio/mpeg',
                 },
                 data: audioBuffer,
             });
 
-            const sttJson = await sttRes.json().catch(() => ({}));
-            const text = sttJson.text || sttJson._text;
-
+            const json = await sttRes.json().catch(() => ({}));
+            const text = json.text || json._text;
             if (text) {
-                console.log(`💡 语音识别成功结果: "${text.trim()}"`);
+                console.log(`💡 语音识别成功: "${text.trim()}"`);
                 await frame.locator('#audio-response').fill(text.trim());
                 await frame.locator('#recaptcha-verify-button').click();
                 await page.waitForTimeout(2000);
@@ -76,16 +61,13 @@ async function solveAudioRecaptcha(page) {
             }
         }
     } catch (e) {
-        console.log(`⚠️ 语音验证过程提示: ${e.message}`);
+        console.log(`⚠️ 语音识别跳过: ${e.message}`);
     }
     return false;
 }
 
-test('OptikLink 保活', async ({ }, testInfo) => {
-    let proxyConfig = undefined;
-    if (process.env.GOST_PROXY) {
-        proxyConfig = { server: process.env.GOST_PROXY };
-    }
+test('OptikLink 保活', async () => {
+    const proxyConfig = process.env.GOST_PROXY ? { server: process.env.GOST_PROXY } : undefined;
 
     const browser = await chromium.launch({
         headless: true,
@@ -100,57 +82,55 @@ test('OptikLink 保活', async ({ }, testInfo) => {
 
     const page = await context.newPage();
     page.setDefaultTimeout(TIMEOUT);
-    let activePage = page;
 
     await page.addInitScript(() => {
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     });
 
+    let extractedUser = null;
+    let extractedPass = null;
+
     try {
+        // 1. 打开主站登录页
         console.log('🔑 打开 OptikLink 登录页...');
-        await page.goto('https://optiklink.com/auth', { waitUntil: 'domcontentloaded' });
-        await page.click("a[href='login']");
-
-        await page.waitForURL(url => !url.toString().includes('optiklink.com/auth'), { timeout: TIMEOUT });
-
-        // Discord 登录逻辑处理...
-        if (page.url().includes('discord.com/login')) {
-            await page.fill('input[name="email"]', email);
-            await page.fill('input[name="password"]', password);
-            await page.click('button[type="submit"]');
-            await page.waitForTimeout(3000);
-        }
-
-        // ==================== 数学验证 ====================
         await page.goto('https://optiklink.net/login', { waitUntil: 'domcontentloaded' });
         await page.waitForTimeout(2000);
 
-        const mathExpr = await page.evaluate(() => {
-            const match = document.body.innerText.match(/(\d+)\s*([\+\-\*])\s*(\d+)/);
-            return match ? { n1: parseInt(match[1]), op: match[2], n2: parseInt(match[3]) } : null;
-        });
-
-        if (mathExpr) {
-            let res = mathExpr.op === '+' ? mathExpr.n1 + mathExpr.n2 : mathExpr.n1 - mathExpr.n2;
-            const inputLoc = page.locator('input[type="number"], input[type="text"]').first();
-            if (await inputLoc.isVisible()) await inputLoc.fill(String(res));
+        // 如果重定向到了 Discord 授权页
+        if (page.url().includes('discord.com')) {
+            console.log('🔑 填入 Discord 账号密码...');
+            await page.fill('input[name="email"]', email);
+            await page.fill('input[name="password"]', password);
+            await page.click('button[type="submit"]');
+            await page.waitForTimeout(4000);
         }
 
-        const continueBtn = page.locator('button:has-text("CONTINUE WITH LOGIN"), a:has-text("CONTINUE WITH LOGIN")').first();
-        if (await continueBtn.isVisible().catch(() => false)) await continueBtn.click();
-        await page.waitForTimeout(3000);
+        // 2. 数学验证
+        if (page.url().includes('optiklink.net/login')) {
+            const mathExpr = await page.evaluate(() => {
+                const match = document.body.innerText.match(/(\d+)\s*([\+\-\*])\s*(\d+)/);
+                return match ? { n1: parseInt(match[1]), op: match[2], n2: parseInt(match[3]) } : null;
+            });
 
-        // ==================== 提取 Panel 密码与跳转 ====================
-// ==================== 4. 等待跳转至 Dashboard 并点击 Panel 弹窗 ====================
-        console.log('⏳ 等待页面跳转至 Dashboard...');
-        // 确保页面已不在 login 路径，或显式等待 Dashboard 关键元素
-        await page.waitForURL(url => !url.toString().includes('/login'), { timeout: 30000 }).catch(() => {});
+            if (mathExpr) {
+                const res = mathExpr.op === '+' ? mathExpr.n1 + mathExpr.n2 : mathExpr.n1 - mathExpr.n2;
+                console.log(`🧮 计算数学题: ${mathExpr.n1} ${mathExpr.op} ${mathExpr.n2} = ${res}`);
+                const inputLoc = page.locator('input[type="number"], input[type="text"]').first();
+                if (await inputLoc.isVisible()) await inputLoc.fill(String(res));
+            }
+
+            const continueBtn = page.locator('button:has-text("CONTINUE WITH LOGIN"), a:has-text("CONTINUE WITH LOGIN")').first();
+            if (await continueBtn.isVisible().catch(() => false)) await continueBtn.click();
+            await page.waitForTimeout(3000);
+        }
+
+        // 3. 等待进入 Dashboard 并动态打开弹窗抓取凭据
+        console.log('⏳ 等待跳转至 Dashboard 并获取 Panel 凭据...');
+        await page.waitForURL(url => !url.toString().includes('/login'), { timeout: 20000 }).catch(() => {});
         await page.waitForLoadState('domcontentloaded');
 
-        console.log('📤 寻找并打开 Login to Panel 弹窗...');
-        
-        // 兼容 Bootstrap 4、Bootstrap 5 及文本匹配的多重选择器
-        const panelModalTrigger = page.locator([
+        // 兼容多个属性的选择器（解决 selector 找不到导致卡死 60s 的问题）
+        const modalBtn = page.locator([
             'a[data-target="#logintopanel"]',
             'button[data-target="#logintopanel"]',
             'a[data-bs-target="#logintopanel"]',
@@ -159,83 +139,76 @@ test('OptikLink 保活', async ({ }, testInfo) => {
             'button:has-text("Login to Panel")'
         ].join(',')).first();
 
-        // 等待元素可见再点击，若找不到则直接寻找页面上的控制台信息
-        try {
-            await panelModalTrigger.waitFor({ state: 'visible', timeout: 15000 });
-            await panelModalTrigger.click();
-            await page.waitForTimeout(1500);
-        } catch (e) {
-            console.log('⚠️ 未找到 Panel 弹窗按钮，尝试直接解析当前页面...');
-        }
+        // 限时 15 秒等待按钮出现，避免全局长超时
+        await modalBtn.waitFor({ state: 'visible', timeout: 15000 });
+        await modalBtn.click();
+        await page.waitForTimeout(1500);
 
-        // ==================== 5. 提取 Panel 用户名与密码 ====================
+        // 点击显示密码按钮
         const viewPasswordBtn = page.locator('text="[Click here to view]"').first();
-        if (await viewPasswordBtn.isVisible().catch(() => false)) {
+        if (await viewPasswordBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
             await viewPasswordBtn.click();
             await page.waitForTimeout(1000);
         }
 
-        const credentials = await page.evaluate(() => {
+        // 正则解析弹窗中的账号密码
+        const creds = await page.evaluate(() => {
             const text = document.body.innerText;
             const uMatch = text.match(/Your Panel Username:\s*([a-zA-Z0-9_]+)/i);
             const pMatch = text.match(/Your Panel Password:\s*([^\s\n\r]+)/i);
-            return { 
-                username: uMatch ? uMatch[1] : null, 
-                password: pMatch ? pMatch[1] : null 
-            };
+            return { username: uMatch ? uMatch[1] : null, password: pMatch ? pMatch[1] : null };
         });
 
-        console.log(`🔑 成功获取控制台账号: ${credentials.username || '未获取到'}`);
+        extractedUser = creds.username;
+        extractedPass = creds.password;
+        console.log(`🔑 成功提取控制台账号: ${extractedUser || '提取失败'}`);
 
-        // ==================== 6. 跳转控制台 ====================
-        const panelLoginBtn = page.locator([
-            'a:has-text("Panel Login")',
-            'button:has-text("Panel Login")',
-            'a[href*="/auth/login"]'
-        ].join(',')).first();
+        if (!extractedUser || !extractedPass) {
+            throw new Error('未能在弹窗中解析到有效的 Panel 账号密码');
+        }
 
-        const [panelPage] = await Promise.all([
-            context.waitForEvent('page', { timeout: 15000 }).catch(() => page),
-            panelLoginBtn.click().catch(async () => {
-                // 若未找到跳转按钮，直接访问控制台默认登录页
-                await page.goto('https://panel.optiklink.net/auth/login', { waitUntil: 'domcontentloaded' });
-                return page;
-            }),
-        ]);
+        // 4. 跳转控制台并登录
+        const panelLoginBtn = page.locator('a:has-text("Panel Login"), button:has-text("Panel Login")').first();
+        let panelPage = page;
 
-        activePage = panelPage;
-        await panelPage.waitForLoadState('domcontentloaded');
-        await panelPage.waitForTimeout(3000);
-
-        activePage = panelPage;
-        await panelPage.waitForLoadState('domcontentloaded');
-        await panelPage.waitForTimeout(3000);
-
-        // ==================== 控制台登录与人机验证破解 ====================
-        if (!panelPage.url().includes('/auth/login')) {
-            console.log('🎉 已静默登录控制台！');
+        if (await panelLoginBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
+            const [newPage] = await Promise.all([
+                context.waitForEvent('page', { timeout: 10000 }).catch(() => page),
+                panelLoginBtn.click(),
+            ]);
+            panelPage = newPage;
         } else {
-            console.log('✏️ 填入控制台账密...');
-            await panelPage.locator('input[name="username"]').fill(credentials.username);
-            await panelPage.locator('input[name="password"]').fill(credentials.password);
-            
-            console.log('📤 点击登录按钮...');
+            console.log('🌐 直接导航至 Panel 控制台登录页...');
+            await page.goto('https://panel.optiklink.net/auth/login', { waitUntil: 'domcontentloaded' });
+        }
+
+        await panelPage.waitForLoadState('domcontentloaded');
+        await panelPage.waitForTimeout(3000);
+
+        if (!panelPage.url().includes('/auth/login')) {
+            console.log('🎉 控制台已处于登录状态！');
+        } else {
+            console.log('✏️ 填入提取到的控制台账密...');
+            await panelPage.locator('input[name="username"]').fill(extractedUser);
+            await panelPage.locator('input[name="password"]').fill(extractedPass);
+
+            console.log('📤 点击控制台登录...');
             await panelPage.locator('button[type="submit"]').click();
             await panelPage.waitForTimeout(3000);
 
-            // 检查是否出现 reCAPTCHA 拦截并尝试语音破解
-            await solveAudioRecaptcha(panelPage);
+            // 破解 reCAPTCHA 拦截
+            await solveRecaptchaAudio(panelPage);
 
-            console.log('⏳ 等待控制台登录跳转...');
-            await panelPage.waitForURL(url => !url.toString().includes('/auth/login'), { timeout: 35000 });
+            // 确认登录跳转
+            await panelPage.waitForURL(url => !url.toString().includes('/auth/login'), { timeout: 25000 });
+            console.log(`✅ 控制台登录成功！当前页面: ${panelPage.url()}`);
         }
 
-        console.log(`✅ 控制台登录成功！${panelPage.url()}`);
-        await sendTG('✅ 保活成功！', 'OptikLink');
+        await sendTG(`✅ 保活成功！已成功登录控制台 (${extractedUser})`);
 
     } catch (e) {
-        console.log(`❌ 异常: ${e.message}`);
-        await sendTG(`❌ 脚本异常: ${e.message}`);
+        console.log(`❌ 执行过程抛出异常: ${e.message}`);
+        await sendTG(`❌ 保活失败: ${e.message}`);
         throw e;
     } finally {
         await browser.close();
