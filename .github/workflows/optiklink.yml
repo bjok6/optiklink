@@ -67,7 +67,7 @@ jobs:
       - name: 🚀 运行保活脚本
         env:
           DISCORD_ACCOUNT: ${{ secrets.DISCORD_ACCOUNT }}
-          PANEL_ACCOUNT: ${{ secrets.PANEL_ACCOUNT }}
+          PANEL_API_KEY: ${{ secrets.PANEL_API_KEY }}
           TG_BOT: ${{ secrets.TG_BOT }}
           NODE_LINK: ${{ secrets.NODE_LINK }}   # 必须传，config 靠它开 proxy
         run: |
@@ -79,13 +79,6 @@ jobs:
           fi
           npx playwright test
 
-      - name: 📸 上传失败截图
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: failure-screenshots
-          path: test-results/
-          retention-days: 7
 
       # ========== 防止 60 天无活动禁用 workflow ==========
       - name: 📅 更新 time.txt 保持仓库活跃
@@ -105,10 +98,17 @@ jobs:
             echo "✅ time.txt 已更新并推送"
           fi
 
-      - name: 🧹 清理旧的运行记录
-        uses: Mattraks/delete-workflow-runs@v2
-        with:
-          token: ${{ github.token }}
-          repository: ${{ github.repository }}
-          retain_days: 0
-          keep_minimum_runs: 3
+      - name: 🧹 清理旧的工作流运行记录
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId')
+          count=0
+          for run_id in $runs; do
+            count=$((count + 1))
+            if [ $count -gt 1 ]; then
+              echo "删除运行记录: $run_id"
+              gh run delete $run_id || true
+            fi
+          done
